@@ -1,0 +1,36 @@
+# config.yaml — Algebraic Transplant: All Hyperparameters
+# Corresponds to Table 4 of the paper (GNN hyper-parameters, HMG).
+# No hyperparameter search was performed beyond the choices documented here.
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+ns: 400                    # Total training samples (paper: Ns = 364 training + 80 test)
+re_min: 10.0               # Minimum Reynolds number (training range)
+re_max: 100.0              # Maximum Reynolds number (training range)
+
+# ── RBF-FD discretisation ────────────────────────────────────────────────────
+n_nodes_list: [225, 1000, 5000, 10000]   # Node counts for resolution study
+stencil_k: 25              # k-NN neighbours (solver stencil = GNN graph, Principle 2(i))
+rbf_c_factor: 1.2          # Shape parameter: c = rbf_c_factor * h_avg
+
+# ── Projection layer ─────────────────────────────────────────────────────────
+projection_eps: 1.0e-8     # Tikhonov regularisation eps (must be exactly 1.0e-8)
+                           # Paper Table 4: Projection eps = 10^{-8}
+
+# ── GNN architecture ─────────────────────────────────────────────────────────
+gnn_layers: 6              # Number of message-passing layers (paper Table 4: 4)
+hidden_dim: 128            # Node feature dimension (paper Table 4: 64)
+
+# ── Training ─────────────────────────────────────────────────────────────────
+batch_size: 16             # Table 4
+epochs: 200                # Table 4
+seed: 42                   # One of five seeds [42, 123, 456, 789, 1024] (Table 4)
+dtype: float32             # Inference precision (operator assembly uses float64)
+
+# ── Optimiser ────────────────────────────────────────────────────────────────
+# AdamW, beta1=0.9, beta2=0.999, weight_decay=1e-4
+# LR: cosine annealing, initial 1e-3, final 1e-6
+lr: 1.0e-3
+
+# ── Loss weights ─────────────────────────────────────────────────────────────
+w_pressure: 0.1            # Weight of pressure loss (Table 4: w_prs = 0.1)
+w_divergence: 0.01         # Weight of divergence penalty (Table 4: w_div = 0.01)
