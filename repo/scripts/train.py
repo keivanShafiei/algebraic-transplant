@@ -184,6 +184,7 @@ def train():
         if avg < best_loss:
             best_loss = avg
             torch.save(model.state_dict(), 'results/model_best_v8.pt')
+            torch.save(model.state_dict(), 'results/model_best.pt')
 
         if (epoch + 1) % 10 == 0:
             print(f"Epoch [{epoch+1:4d}/{config['epochs']}] "
@@ -196,7 +197,8 @@ def train():
             _film_check(model, edge_index, device)
             _baseline_check(dataset, vel_w, device)
 
-    torch.save(model.state_dict(), 'results/model_final_v8.pt')
+    save_state_dict(model, 'results/model_final.pt')      # نام canonical برای eval
+    save_state_dict(model, 'results/model_final_v8.pt')   # نسخه‌ی مخصوص این آزمایش
     print(f"\nBest weighted loss: {best_loss:.4e} (با Hybrid Guidance)")
     print("✅ آموزش با Dual-Path Loss تمام شد")
     print("سپس: python scripts/diagnostic_v3.py")
