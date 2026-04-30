@@ -39,14 +39,15 @@ def main() -> None:
     plot_resolution_invariance()
 
     # Figure 10: Projection efficacy — requires trained model + RBF-FD samples
-    model_path  = 'results/model_final.pt'
-    sample_dir  = 'data/samples'
-
+    model_path = 'results/model_final.pt'
+    sample_dir = 'data/samples'
+    
     if os.path.exists(model_path) and os.path.isdir(sample_dir) and \
             any(f.endswith('.pt') for f in os.listdir(sample_dir)):
         print("[Fig 10] Projection efficacy (Algorithm 3 — using saved model and samples)")
-        from scripts.eval_projection import run_projection_eval
-        run_eval == run_projection_eval(
+        from scripts.eval_projection_fixed import run_projection_eval
+    
+        rb, ra, rhos = run_projection_eval(
             sample_dir=sample_dir,
             model_path=model_path,
         )
@@ -55,11 +56,8 @@ def main() -> None:
         print("[Fig 10] SKIPPED — requires:")
         if not os.path.exists(model_path):
             print(f"          ✗ {model_path}  (run scripts/train.py)")
-        if not os.path.isdir(sample_dir) or \
-                not any(f.endswith('.pt') for f in os.listdir(sample_dir) if os.path.isdir(sample_dir)):
+        if not os.path.isdir(sample_dir) or not any(f.endswith('.pt') for f in os.listdir(sample_dir)):
             print(f"          ✗ {sample_dir}/sample_*.pt  (run RBF-FD solver, Algorithm 1)")
-
-    print()
 
     # ── GF2: Figures NOT yet generatable — honest inventory ──────────────────
     missing = [
