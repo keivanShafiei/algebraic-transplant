@@ -33,6 +33,9 @@ w_vel: 1.0                # وزن ضرر سرعت
 w_prs: 0.1                # وزن ضرر فشار
 w_div: 0.01               # وزن ضرر واگرایی (فیزیکی)
 
+# --- Numerical Stability ---
+projection_eps: 1e-06
+
 # --- Checkpointing ---
 save_freq: 10             # ذخیره چک‌پوینت هر چند اپوک
 results_dir: 'results'    # پوشه خروجی
