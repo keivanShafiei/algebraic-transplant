@@ -200,6 +200,9 @@ class NeuralOperator(nn.Module):
         )
         self.register_buffer("h_train", torch.tensor(float("nan"), dtype=torch.float32))
         self.register_buffer("h_infer", torch.tensor(float("nan"), dtype=torch.float32))
+        
+        # Store stencils for checkpoint metadata (non-persistent, used for h_avg computation)
+        self._stencils = None
 
     @staticmethod
     def _compute_h_avg(points: torch.Tensor, stencils: torch.Tensor) -> torch.Tensor:
@@ -223,7 +226,8 @@ class NeuralOperator(nn.Module):
         """
         self.points = points.detach().to(dtype=torch.float32)
         if stencils is not None:
-            h = self._compute_h_avg(self.points, stencils.to(self.points.device))
+            self._stencils = stencils.detach().to(dtype=torch.int64)
+            h = self._compute_h_avg(self.points, self._stencils)
             self.h_infer = h.detach().to(dtype=torch.float32)
             if torch.isnan(self.h_train):
                 self.h_train = self.h_infer.clone()
