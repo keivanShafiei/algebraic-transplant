@@ -178,41 +178,44 @@ def train():
     )
 
     # =========================
-    AMP
+    # AMP Setup (Mixed Precision)
     # =========================
+    # استفاده از API جدید torch.amp برای سازگاری با نسخه‌های جدید
     scaler = GradScaler(device_type='cuda', enabled=torch.cuda.is_available())
-
+    
     lambda_guidance = 0.1
     lambda_milestone = 150
 
-    print("Training started (Hybrid Dual-Path)")
+    print("🚀 Training started (Hybrid Dual-Path)")
+    print(f"   Devices: {next(model.parameters()).device}")
+    print(f"   Mixed Precision: {'Enabled' if torch.cuda.is_available() else 'Disabled'}")
 
     best_loss = float('inf')
 
     # =========================
-    # Loop
+    # Training Loop
     # =========================
     for epoch in range(config['epochs']):
         model.train()
-
-        total = 0
+        total_loss = 0.0
         current_lambda = 0.01 if epoch >= lambda_milestone else lambda_guidance
 
         for mu, a_ref, b_ref, a_sc, b_sc in loader:
-
+            # انتقال داده‌ها به GPU
             mu = mu.to(device).float()
             a_ref = a_ref.to(device).float()
             b_ref = b_ref.to(device).float()
             a_sc = a_sc.to(device).float()
             b_sc = b_sc.to(device).float()
 
+            # نرمال‌سازی targets
             a_norm = a_ref / a_sc.view(-1, 1)
             b_norm = b_ref / b_sc.view(-1, 1)
 
             optimizer.zero_grad()
 
+            # Forward pass با Mixed Precision
             with autocast(device_type='cuda', dtype=torch.float16):
-
                 a_hat, a_no, b = model(mu, edge_index)
 
                 loss_physics = variance_weighted_loss(a_no, a_norm, vel_w)
@@ -221,27 +224,29 @@ def train():
 
                 loss = loss_physics + current_lambda * loss_guidance + 0.1 * loss_p
 
+            # Backward pass با Scaler
             scaler.scale(loss).backward()
+            
+            # Unscale و Clip گرادیان‌ها
             scaler.unscale_(optimizer)
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+            # به‌روزرسانی وزن‌ها
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
 
-            total += loss.item()
+            total_loss += loss.item()
 
-        avg = total / len(loader)
+        avg_loss = total_loss / len(loader)
 
         # =========================
-        # Save best
+        # Save Best Model
         # =========================
         unwrapped = model.module if use_multi_gpu else model
 
-        if avg < best_loss:
-            best_loss = avg
-
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             save_checkpoint(
                 model=unwrapped,
                 optimizer=optimizer,
@@ -250,12 +255,17 @@ def train():
                 loss=best_loss,
                 config=config,
                 path='results/model_best_v8.pt',
+                metadata={
+                    'training_n_nodes': N,
+                    'stencil_k': config.get('stencil_k', 25),
+                    'lambda_guidance': current_lambda
+                }
             )
 
         if epoch % 10 == 0:
-            print(f"Epoch {epoch} | Loss {avg:.4e} | λ {current_lambda}")
+            print(f"Epoch {epoch:3d} | Loss: {avg_loss:.4e} | λ: {current_lambda:.3f}")
 
-    print("Training finished. Best loss:", best_loss)
+    print(f"\n✅ Training finished. Best loss: {best_loss:.4e}")
 
 
 # =========================
