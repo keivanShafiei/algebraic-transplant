@@ -201,43 +201,61 @@ def train():
         current_lambda = 0.01 if epoch >= lambda_milestone else lambda_guidance
 
         for mu, a_ref, b_ref, a_sc, b_sc in loader:
-            # انتقال داده‌ها به GPU
-            mu = mu.to(device).float()
-            a_ref = a_ref.to(device).float()
-            b_ref = b_ref.to(device).float()
-            a_sc = a_sc.to(device).float()
-            b_sc = b_sc.to(device).float()
+            # انتقال داده‌ها به دستگاه اصلی (DataParallel خودکار توزیع می‌کند)
+            mu = mu.to(device).float()       # Shape: (B, param_dim)
+            a_ref = a_ref.to(device).float() # Shape: (B, 2N)
+            b_ref = b_ref.to(device).float() # Shape: (B, N)
+            a_sc = a_sc.to(device).float()   # Shape: (B,)
+            b_sc = b_sc.to(device).float()   # Shape: (B,)
 
-            # نرمال‌سازی targets
+            # نرمال‌سازی هدف
             a_norm = a_ref / a_sc.view(-1, 1)
             b_norm = b_ref / b_sc.view(-1, 1)
 
             optimizer.zero_grad()
 
-            # Forward pass با Mixed Precision
-            with autocast(device_type='cuda', dtype=torch.float16):
-                a_hat, a_no, b = model(mu, edge_index)
+            # بررسی ابعاد برای دیباگ (اختیاری - فقط در اپوک اول)
+            if epoch == 0 and batch_idx == 0: # نیاز به تعریف batch_idx دارید یا این چک را حذف کنید
+                # print(f"Debug Shapes: mu={mu.shape}, edge_index={edge_index.shape}")
+                pass
 
+            with autocast('cuda', dtype=torch.float16):
+                #forward pass
+                # نکته: edge_index باید برای هر نمونه در بچ یکسان باشد.
+                # اگر خطا persists کرد، شاید نیاز باشد edge_index را هم به اندازه بچ تکرار کنیم
+                # اما معمولاً در GNNها edge_index مشترک است و فقط x تغییر می‌کند.
+                
+                try:
+                    a_hat, a_no, b = model(mu, edge_index)
+                except RuntimeError as e:
+                    if "mat1 and mat2" in str(e):
+                        print(f"\n❌ Dimension Mismatch Detected!")
+                        print(f"   Input mu shape: {mu.shape}")
+                        print(f"   Expected input dim for model: {base_model.d}") # دسترسی به مدل پایه
+                        print(f"   Error details: {e}")
+                        raise e
+                    else:
+                        raise e
+
+                # محاسبه ضرر
                 loss_physics = variance_weighted_loss(a_no, a_norm, vel_w)
                 loss_guidance = variance_weighted_loss(a_hat, a_norm, vel_w)
                 loss_p = variance_weighted_loss(b, b_norm, prs_w)
 
                 loss = loss_physics + current_lambda * loss_guidance + 0.1 * loss_p
 
-            # Backward pass با Scaler
+            # Backpropagation
             scaler.scale(loss).backward()
-            
-            # Unscale و Clip گرادیان‌ها
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            # به‌روزرسانی وزن‌ها
+            
+            # Clip gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
 
             total_loss += loss.item()
-
         avg_loss = total_loss / len(loader)
 
         # =========================
