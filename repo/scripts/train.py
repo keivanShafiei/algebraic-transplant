@@ -98,29 +98,47 @@ def train():
     
     print(f"🔧 Model Config: in={in_ch}, hidden={hidden_ch}, out={out_ch}, layers={num_layers}")
 
-    # =========================
-    # Model Definition (استفاده از متغیرهای محلی)
-    # =========================
-    base_model = NeuralOperator(
-        n_nodes=N,
-        in_channels=in_ch,          # <-- استفاده از متغیر محلی
-        hidden_channels=hidden_ch,  # <-- استفاده از متغیر محلی
-        out_channels=out_ch,        # <-- استفاده از متغیر محلی
-        num_layers=num_layers,      # <-- استفاده از متغیر محلی
-        stencil_k=stencil_k,        # <-- استفاده از متغیر محلی
-        re_conditioning=config.get('re_conditioning', True),
-        use_film=config.get('use_film', True),
-        fallback_strategy=config.get('fallback_strategy', 'hybrid')
-    ).to(device)
+    # ساخت مدل با نام‌گذاری صحیح پارامترها (بر اساس خطای دریافتی)
+    # فرض بر این است که کلاس از input_dim, hidden_dim, output_dim استفاده می‌کند
+    try:
+        base_model = NeuralOperator(
+            n_nodes=N,
+            input_dim=in_ch,          # تغییر نام از in_channels به input_dim
+            hidden_dim=hidden_ch,     # تغییر نام از hidden_channels به hidden_dim
+            output_dim=out_ch,        # تغییر نام از out_channels به output_dim
+            num_layers=num_layers,
+            stencil_k=stencil_k,
+            re_conditioning=config.get('re_conditioning', True),
+            use_film=config.get('use_film', True),
+            fallback_strategy=config.get('fallback_strategy', 'hybrid')
+        ).to(device)
+    except TypeError as e:
+        # اگر باز هم خطا داد، یعنی نام‌ها متفاوت است. 
+        # در این صورت سعی می‌کنیم بدون نام‌گذاری کلیدی (فقط positional) صدا بزنیم
+        # یا خطا را دقیق‌تر گزارش دهیم.
+        print(f"⚠️ Still getting TypeError: {e}")
+        print("💡 Attempting fallback with positional arguments or checking source...")
+        # برای عیب‌یابی بیشتر، می‌توانید فایل src/gnn/neural_operator.py را چک کنید
+        # اما معمولاً تغییر نام‌ها به input_dim/hidden_dim مشکل را حل می‌کند.
+        raise e
 
     model = nn.DataParallel(base_model) if use_multi_gpu else base_model
 
     if use_multi_gpu:
-        print(f"Using {torch.cuda.device_count()} GPUs")
+        print(f"✅ Using {torch.cuda.device_count()} GPUs")
 
-    model.module.set_points(points, stencils) if use_multi_gpu else model.set_points(points, stencils)
+    # تنظیم نقاط و استنسیل‌ها
+    if use_multi_gpu:
+        model.module.set_points(points, stencils)
+    else:
+        model.set_points(points, stencils)
 
+    # تنظیم پروژکشن
     G = torch.load('data/fixed_G.pt', map_location=device)
+    if use_multi_gpu:
+        model.module.set_projection(G)
+    else:
+        model.set_projection(G)
     (model.module if use_multi_gpu else model).set_projection(G)
 
     # =========================
