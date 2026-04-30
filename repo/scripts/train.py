@@ -89,6 +89,16 @@ def train():
     edge_dst = stencils.reshape(-1)
     edge_src = torch.arange(N, device=device).repeat_interleave(config['stencil_k'])
     edge_index = torch.stack([edge_dst, edge_src])
+    n_nodes = N
+    in_channels = config.get('in_channels', 3)          # پیش‌فرض: 3 (x, y, Re)
+    hidden_channels = config.get('hidden_channels', 64) # پیش‌فرض: 64
+    out_channels = config.get('out_channels', 3)        # پیش‌فرض: 3 (u, v, p)
+    num_layers = config.get('num_layers', 4)            # پیش‌فرض: 4
+    stencil_k = config.get('stencil_k', 25)             # پیش‌فرض: 25
+    re_conditioning = config.get('re_conditioning', True)
+    use_film = config.get('use_film', True)
+    fallback_strategy = config.get('fallback_strategy', 'hybrid')
+    print(f"🔧 Model Config: in={in_channels}, hidden={hidden_channels}, out={out_channels}, layers={num_layers}")
 
     # =========================
     # Model (FIX: تعریف صحیح)
