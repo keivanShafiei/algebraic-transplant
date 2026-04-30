@@ -103,29 +103,33 @@ def train():
     try:
         base_model = NeuralOperator(
             n_nodes=N,
-            input_dim=in_ch,          # تغییر نام از in_channels به input_dim
-            hidden_dim=hidden_ch,     # تغییر نام از hidden_channels به hidden_dim
-            output_dim=out_ch,        # تغییر نام از out_channels به output_dim
-            num_layers=num_layers,
-            stencil_k=stencil_k,
-            re_conditioning=config.get('re_conditioning', True),
-            use_film=config.get('use_film', True),
-            fallback_strategy=config.get('fallback_strategy', 'hybrid')
+            d=config.get('in_channels', 3),          # تطبیق با in_channels
+            param_dim=1,                             # فرض بر تک‌پارامتری بودن (Re)
+            k=config.get('stencil_k', 25),           # تطبیق با stencil_k
+            hidden=config.get('hidden_channels', 64),# تطبیق با hidden_channels
+            layers=config.get('num_layers', 4),      # تطبیق با num_layers
+            eps=1e-06
         ).to(device)
-    except TypeError as e:
-        # اگر باز هم خطا داد، یعنی نام‌ها متفاوت است. 
-        # در این صورت سعی می‌کنیم بدون نام‌گذاری کلیدی (فقط positional) صدا بزنیم
-        # یا خطا را دقیق‌تر گزارش دهیم.
-        print(f"⚠️ Still getting TypeError: {e}")
-        print("💡 Attempting fallback with positional arguments or checking source...")
-        # برای عیب‌یابی بیشتر، می‌توانید فایل src/gnn/neural_operator.py را چک کنید
-        # اما معمولاً تغییر نام‌ها به input_dim/hidden_dim مشکل را حل می‌کند.
-        raise e
+    except Exception as e:
+        print(f"⚠️ Error with keyword args: {e}")
+        print("💡 Falling back to positional arguments...")
+        # فراخوانی موقعیتی در صورت شکست نام‌گذاری
+        base_model = NeuralOperator(
+            N,                                     # n_nodes
+            config.get('in_channels', 3),          # d
+            1,                                     # param_dim
+            config.get('stencil_k', 25),           # k
+            config.get('hidden_channels', 64),     # hidden
+            config.get('num_layers', 4),           # layers
+            1e-06                                  # eps
+        ).to(device)
 
-    model = nn.DataParallel(base_model) if use_multi_gpu else base_model
-
+    # مدیریت Multi-GPU
     if use_multi_gpu:
-        print(f"✅ Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(base_model)
+        print(f"✅ Wrapped with DataParallel ({torch.cuda.device_count()} GPUs)")
+    else:
+        model = base_model
 
     # تنظیم نقاط و استنسیل‌ها
     if use_multi_gpu:
@@ -139,6 +143,7 @@ def train():
         model.module.set_projection(G)
     else:
         model.set_projection(G)
+
     (model.module if use_multi_gpu else model).set_projection(G)
 
     # =========================
