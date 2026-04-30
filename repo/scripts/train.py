@@ -195,14 +195,20 @@ def train():
     # =========================
     # Training Loop
     # =========================
+    # =========================
+    # Training Loop
+    # =========================
+    print(f"   Starting training loop for {config['epochs']} epochs...")
+    
     for epoch in range(config['epochs']):
         model.train()
         total_loss = 0.0
         current_lambda = 0.01 if epoch >= lambda_milestone else lambda_guidance
 
-        for mu, a_ref, b_ref, a_sc, b_sc in loader:
-            # انتقال داده‌ها به دستگاه اصلی (DataParallel خودکار توزیع می‌کند)
-            mu = mu.to(device).float()       # Shape: (B, param_dim)
+        # اضافه کردن شمارنده بچ برای دیباگ
+        for batch_idx, (mu, a_ref, b_ref, a_sc, b_sc) in enumerate(loader):
+            # انتقال داده‌ها به دستگاه اصلی
+            mu = mu.to(device).float()       # Shape مورد انتظار: (B, param_dim) یا (B, 1)
             a_ref = a_ref.to(device).float() # Shape: (B, 2N)
             b_ref = b_ref.to(device).float() # Shape: (B, N)
             a_sc = a_sc.to(device).float()   # Shape: (B,)
@@ -214,25 +220,39 @@ def train():
 
             optimizer.zero_grad()
 
-            # بررسی ابعاد برای دیباگ (اختیاری - فقط در اپوک اول)
-            if epoch == 0 and batch_idx == 0: # نیاز به تعریف batch_idx دارید یا این چک را حذف کنید
-                # print(f"Debug Shapes: mu={mu.shape}, edge_index={edge_index.shape}")
-                pass
+            # بررسی ابعاد برای دیباگ (فقط در اولین بچ از اولین اپوک)
+            if epoch == 0 and batch_idx == 0:
+                print(f"\n🔍 Debug Info (Epoch 0, Batch 0):")
+                print(f"   Input mu shape: {mu.shape}")
+                print(f"   Target a_norm shape: {a_norm.shape}")
+                print(f"   Target b_norm shape: {b_norm.shape}")
+                print(f"   edge_index shape: {edge_index.shape}")
+                
+                # بررسی سازگاری بعد ورودی مدل با داده‌ها
+                expected_input_dim = base_model.d
+                actual_input_dim = mu.shape[1] if len(mu.shape) > 1 else 1
+                
+                if actual_input_dim != expected_input_dim:
+                    print(f"   ⚠️ WARNING: Input dimension mismatch!")
+                    print(f"      Model expects 'd' (input_dim) = {expected_input_dim}")
+                    print(f"      Data provides dimension = {actual_input_dim}")
+                    print(f"      Fix: Adjust config['in_channels'] or check data generation.")
+                    # اگر ناسازگاری جدی است، می‌توانیم اینجا خطا بگیریم یا ادامه دهیم تا خطای اصلی پایتورچ بیاید
+                    # raise ValueError(f"Input dim mismatch: Model={expected_input_dim}, Data={actual_input_dim}")
 
             with autocast('cuda', dtype=torch.float16):
-                #forward pass
-                # نکته: edge_index باید برای هر نمونه در بچ یکسان باشد.
-                # اگر خطا persists کرد، شاید نیاز باشد edge_index را هم به اندازه بچ تکرار کنیم
-                # اما معمولاً در GNNها edge_index مشترک است و فقط x تغییر می‌کند.
-                
                 try:
+                    # Forward pass
+                    # نکته: در DataParallel، mu بین GPUها تقسیم می‌شود. edge_index ثابت است.
                     a_hat, a_no, b = model(mu, edge_index)
+                    
                 except RuntimeError as e:
-                    if "mat1 and mat2" in str(e):
-                        print(f"\n❌ Dimension Mismatch Detected!")
-                        print(f"   Input mu shape: {mu.shape}")
-                        print(f"   Expected input dim for model: {base_model.d}") # دسترسی به مدل پایه
-                        print(f"   Error details: {e}")
+                    error_msg = str(e)
+                    if "mat1 and mat2" in error_msg or "shape" in error_msg.lower():
+                        print(f"\n❌ Dimension Mismatch Detected during Forward Pass!")
+                        print(f"   Error: {e}")
+                        print(f"   Mu shape: {mu.shape}, Edge Index: {edge_index.shape}")
+                        print(f"   Please check if 'd' in NeuralOperator matches mu.shape[1]")
                         raise e
                     else:
                         raise e
@@ -256,6 +276,7 @@ def train():
             scheduler.step()
 
             total_loss += loss.item()
+        
         avg_loss = total_loss / len(loader)
 
         # =========================
