@@ -98,30 +98,39 @@ def train():
     
     print(f"🔧 Model Config: in={in_ch}, hidden={hidden_ch}, out={out_ch}, layers={num_layers}")
 
-    # ساخت مدل با نام‌گذاری صحیح پارامترها (بر اساس خطای دریافتی)
-    # فرض بر این است که کلاس از input_dim, hidden_dim, output_dim استفاده می‌کند
+        # =========================
+    # Model Initialization (FIXED: Force input dim match)
+    # =========================
+    
+    # خواندن یک بچ نمونه برای تشخیص دقیق بعد ورودی
+    sample_mu, _, _, _, _ = next(iter(loader))
+    actual_input_dim = sample_mu.shape[1]  # باید 1 باشد
+    
+    print(f"🔧 Detecting input dimension from data: {actual_input_dim}")
+    print(f"   Config in_channels: {config.get('in_channels', 'N/A')}")
+    print(f"   -> Forcing model input dim (d) to match data: {actual_input_dim}")
+
     try:
         base_model = NeuralOperator(
             n_nodes=N,
-            d=config.get('in_channels', 1),          # تطبیق با in_channels
-            param_dim=1,                             # فرض بر تک‌پارامتری بودن (Re)
-            k=config.get('stencil_k', 25),           # تطبیق با stencil_k
-            hidden=config.get('hidden_channels', 64),# تطبیق با hidden_channels
-            layers=config.get('num_layers', 4),      # تطبیق با num_layers
-            eps=1e-06
+            d=actual_input_dim,              # ✅ اصلاح قطعی: استفاده مستقیم از بعد داده
+            param_dim=1,                     # فرض بر تک‌پارامتری بودن (Re)
+            k=config.get('stencil_k', 25),
+            hidden=config.get('hidden_channels', 64),
+            layers=config.get('num_layers', 4),
+            eps=config.get('projection_eps', 1e-06)
         ).to(device)
     except Exception as e:
         print(f"⚠️ Error with keyword args: {e}")
-        print("💡 Falling back to positional arguments...")
-        # فراخوانی موقعیتی در صورت شکست نام‌گذاری
+        # فراخوانی موقعیتی به عنوان پشتیبان
         base_model = NeuralOperator(
-            N,                                     # n_nodes
-            config.get('in_channels', 3),          # d
-            1,                                     # param_dim
-            config.get('stencil_k', 25),           # k
-            config.get('hidden_channels', 64),     # hidden
-            config.get('num_layers', 4),           # layers
-            1e-06                                  # eps
+            N,                   # n_nodes
+            actual_input_dim,    # d (ورودی)
+            1,                   # param_dim
+            config.get('stencil_k', 25), # k
+            config.get('hidden_channels', 64), # hidden
+            config.get('num_layers', 4), # layers
+            config.get('projection_eps', 1e-06) # eps
         ).to(device)
 
     # مدیریت Multi-GPU
@@ -130,6 +139,23 @@ def train():
         print(f"✅ Wrapped with DataParallel ({torch.cuda.device_count()} GPUs)")
     else:
         model = base_model
+
+    # تنظیم نقاط و استنسیل‌ها
+    if use_multi_gpu:
+        model.module.set_points(points, stencils)
+    else:
+        model.set_points(points, stencils)
+
+    # تنظیم پروژکشن
+    if os.path.exists('data/fixed_G.pt'):
+        G = torch.load('data/fixed_G.pt', map_location=device)
+        if use_multi_gpu:
+            model.module.set_projection(G)
+        else:
+            model.set_projection(G)
+        print("✅ Projection operator loaded.")
+    else:
+        print("⚠️ Warning: data/fixed_G.pt not found. Skipping projection setup.")
 
     # تنظیم نقاط و استنسیل‌ها
     if use_multi_gpu:
