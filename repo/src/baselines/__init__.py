@@ -2,4 +2,4 @@
 from .deeponet import DeepONet
 from .fno import FourierNeuralOperator
 __all__ = ["FourierNeuralOperator"]
-from .pod_rbf import PODRBFSurrogate
+from .pod_rbf import PODRBF
