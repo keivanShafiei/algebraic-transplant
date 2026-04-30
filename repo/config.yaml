@@ -6,7 +6,7 @@
 ns: 400                    # Total training samples (paper: Ns = 364 training + 80 test)
 re_min: 10.0               # Minimum Reynolds number (training range)
 re_max: 100.0              # Maximum Reynolds number (training range)
-
+in_channels: 3
 # ── RBF-FD discretisation ────────────────────────────────────────────────────
 n_nodes_list: [225, 1000, 5000, 10000]   # Node counts for resolution study
 stencil_k: 25              # k-NN neighbours (solver stencil = GNN graph, Principle 2(i))
