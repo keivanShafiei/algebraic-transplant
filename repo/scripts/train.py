@@ -103,7 +103,7 @@ def train():
     try:
         base_model = NeuralOperator(
             n_nodes=N,
-            d=config.get('in_channels', 3),          # تطبیق با in_channels
+            d=config.get('in_channels', 1),          # تطبیق با in_channels
             param_dim=1,                             # فرض بر تک‌پارامتری بودن (Re)
             k=config.get('stencil_k', 25),           # تطبیق با stencil_k
             hidden=config.get('hidden_channels', 64),# تطبیق با hidden_channels
