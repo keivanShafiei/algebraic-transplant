@@ -181,7 +181,7 @@ def train():
     # AMP Setup (Mixed Precision)
     # =========================
     # استفاده از API جدید torch.amp برای سازگاری با نسخه‌های جدید
-    scaler = GradScaler(device_type='cuda', enabled=torch.cuda.is_available())
+    scaler = GradScaler('cuda', enabled=torch.cuda.is_available())
     
     lambda_guidance = 0.1
     lambda_milestone = 150
