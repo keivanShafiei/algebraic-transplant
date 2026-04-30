@@ -1,4 +1,4 @@
-"""train_v8.py — Hybrid Manifold Guidance (Dual-Path Loss)"""
+"""train_v8.py — Hybrid Manifold Guidance (Dual-Path Loss) with Multi-GPU & AMP Optimization."""
 
 import os, math
 import torch
@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast, GradScaler
 
 from src.gnn.neural_operator import NeuralOperator
 from src.rbf_fd.stencils import build_stencils
@@ -86,6 +87,14 @@ def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs('results', exist_ok=True)
 
+    # === Multi-GPU Setup: Use DataParallel if multiple GPUs available ===
+    use_multi_gpu = torch.cuda.device_count() > 1
+    if use_multi_gpu:
+        print(f"🚀 Using {torch.cuda.device_count()} GPUs with DataParallel")
+        print(f"  GPU 0: {torch.cuda.get_device_name(0)}")
+        if torch.cuda.device_count() > 1:
+            print(f"  GPU 1: {torch.cuda.get_device_name(1)}")
+    
     N        = config['n_nodes_list'][0]
     points   = generate_cavity_points(N).to(device)
     stencils = build_stencils(points, config['stencil_k']).to(device)
@@ -100,21 +109,37 @@ def train():
 
     G = torch.load('data/fixed_G.pt', map_location=device)
     model.set_projection(G)
+    
+    # Wrap model with DataParallel for multi-GPU training
+    if use_multi_gpu:
+        model = nn.DataParallel(model)
+        model_module = model.module  # Access underlying module for set_points, etc.
+    else:
+        model_module = model
 
     # === Hybrid Manifold Guidance hyperparameters (قبل از هر پرینت) ===
     lambda_guidance = 0.1          # مقدار اولیه (قوی)
     lambda_milestone = 150         # از اپوک ۱۵۰ به بعد → ۰٫۰۱ (پروجکشن سخت غالب شود)
 
     dataset = PhysicalDataset()
-    loader  = DataLoader(dataset, batch_size=config['batch_size'],
-                         shuffle=True, drop_last=True)
+    # === Optimized DataLoader for high-throughput GPU training ===
+    loader  = DataLoader(
+        dataset, 
+        batch_size=config['batch_size'],
+        shuffle=True, 
+        drop_last=True,
+        num_workers=4,      # Parallel data loading (4 workers)
+        pin_memory=True,    # Pin memory for faster CPU->GPU transfer
+        prefetch_factor=2   # Prefetch 2 batches per worker
+    )
 
     vel_w, prs_w = compute_variance_weights(dataset, device)
 
     lr = config.get('lr', 1e-3)
-    film_params = list(model.film_conditioners.parameters())
+    # Access film_conditioners through model_module for DataParallel compatibility
+    film_params = list(model_module.film_conditioners.parameters())
     film_ids    = {id(p) for p in film_params}
-    base_params = [p for p in model.parameters() if id(p) not in film_ids]
+    base_params = [p for p in model_module.parameters() if id(p) not in film_ids]
 
     optimizer = optim.AdamW([
         {'params': base_params, 'lr': lr},
@@ -128,11 +153,17 @@ def train():
     )
 
     w_vel, w_prs, w_div = 1.0, config.get('w_pressure', 0.1), config.get('w_divergence', 0.01)
+    
+    # === Mixed Precision Training (AMP) Setup ===
+    scaler = GradScaler(enabled=True)  # Automatically disabled if CUDA not available
 
     print(f"train_v8 | Hybrid Manifold Guidance (Dual-Path)")
     print(f"lambda_guidance start={lambda_guidance} → final=0.01 at epoch >= {lambda_milestone}")
     print(f"Dataset={len(dataset)} | Batch={config['batch_size']} | Epochs={config['epochs']}")
-    print(f"w_vel={w_vel} | w_prs={w_prs} | w_div={w_div}\n")
+    print(f"w_vel={w_vel} | w_prs={w_prs} | w_div={w_div}")
+    if use_multi_gpu:
+        print(f"✅ Multi-GPU enabled ({torch.cuda.device_count()} GPUs)")
+    print(f"✅ Mixed Precision (AMP) enabled\n")
 
     best_loss = float('inf')
 
@@ -154,23 +185,29 @@ def train():
             b_norm = b_ref / b_sc.view(-1, 1)
 
             optimizer.zero_grad()
-            # Hybrid forward: همیشه a_hat_raw و a_NO_projected
-            a_hat, a_NO, b = model(mu, edge_index)
+            
+            # === Mixed Precision Forward Pass ===
+            with autocast(dtype=torch.float16):
+                # Hybrid forward: همیشه a_hat_raw و a_NO_projected
+                a_hat, a_NO, b = model(mu, edge_index)
 
-            loss_physics  = variance_weighted_loss(a_NO,  a_norm, vel_w)
-            loss_guidance = variance_weighted_loss(a_hat, a_norm, vel_w)
-            loss_p        = variance_weighted_loss(b,     b_norm, prs_w)
-            div           = torch.einsum('md,bd->bm', G, a_NO)
-            loss_d        = div.pow(2).mean()
+                loss_physics  = variance_weighted_loss(a_NO,  a_norm, vel_w)
+                loss_guidance = variance_weighted_loss(a_hat, a_norm, vel_w)
+                loss_p        = variance_weighted_loss(b,     b_norm, prs_w)
+                div           = torch.einsum('md,bd->bm', G, a_NO)
+                loss_d        = div.pow(2).mean()
 
-            loss = (loss_physics +
-                    current_lambda * loss_guidance +
-                    w_prs * loss_p +
-                    w_div * loss_d)
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+                loss = (loss_physics +
+                        current_lambda * loss_guidance +
+                        w_prs * loss_p +
+                        w_div * loss_d)
+            
+            # === Mixed Precision Backward Pass ===
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model_module.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             tot += loss.item()
@@ -185,8 +222,9 @@ def train():
             best_loss = avg
             # Save with new resolution-aware checkpoint format
             from src.utils.checkpoint import save_checkpoint
+            # Use model_module for checkpoint (unwrapped model)
             save_checkpoint(
-                model=model,
+                model=model_module,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 epoch=epoch,
@@ -195,13 +233,13 @@ def train():
                 path='results/model_best_v8.pt',
                 metadata={
                     'training_n_nodes': N,
-                    'training_h_avg': model.h_infer.item(),
+                    'training_h_avg': model_module.h_infer.item(),
                     'stencil_k': config['stencil_k'],
                     'projection_eps': config['projection_eps'],
                 }
             )
             # Also save legacy format for backward compatibility
-            torch.save(model.state_dict(), 'results/model_best.pt')
+            torch.save(model_module.state_dict(), 'results/model_best.pt')
 
         if (epoch + 1) % 10 == 0:
             print(f"Epoch [{epoch+1:4d}/{config['epochs']}] "
@@ -217,7 +255,7 @@ def train():
     # Save final checkpoint with resolution metadata
     from src.utils.checkpoint import save_checkpoint
     save_checkpoint(
-        model=model,
+        model=model_module,
         optimizer=optimizer,
         scheduler=scheduler,
         epoch=config['epochs'],
@@ -226,12 +264,12 @@ def train():
         path='results/model_final_v8.pt',
         metadata={
             'training_n_nodes': N,
-            'training_h_avg': model.h_infer.item(),
+            'training_h_avg': model_module.h_infer.item(),
             'stencil_k': config['stencil_k'],
             'projection_eps': config['projection_eps'],
         }
     )
-    torch.save(model.state_dict(), 'results/model_final.pt')   # نسخه‌ی مخصوص این آزمایش
+    torch.save(model_module.state_dict(), 'results/model_final.pt')   # نسخه‌ی مخصوص این آزمایش
     print(f"\nBest weighted loss: {best_loss:.4e} (با Hybrid Guidance)")
     print("✅ آموزش با Dual-Path Loss تمام شد")
     print("سپس: python scripts/diagnostic.py")
@@ -253,7 +291,9 @@ def _baseline_check(dataset, vel_w, device):
 
 
 def _film_check(model, edge_index, device):
-    model.eval()
+    # Use model_module if DataParallel wrapped
+    model_to_use = model.module if hasattr(model, 'module') else model
+    model_to_use.eval()
     with torch.no_grad():
         lo = torch.tensor([0.10], device=device)
         hi = torch.tensor([1.00], device=device)
@@ -263,7 +303,7 @@ def _film_check(model, edge_index, device):
         rel = (a_lo - a_hi).norm().item() / (a_lo.norm() + 1e-8).item()
         print(f"\n  FiLM: cos={cos:.4f} | rel_diff={rel:.4e} "
               f"{'✅' if cos < 0.99 else '❌ COLLAPSED'}")
-    model.train()
+    model_to_use.train()
 
 
 if __name__ == '__main__':
