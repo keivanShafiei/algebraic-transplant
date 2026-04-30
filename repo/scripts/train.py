@@ -183,7 +183,24 @@ def train():
         avg = tot / n
         if avg < best_loss:
             best_loss = avg
-            torch.save(model.state_dict(), 'results/model_best_v8.pt')
+            # Save with new resolution-aware checkpoint format
+            from src.utils.checkpoint import save_checkpoint
+            save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                loss=best_loss,
+                config=config,
+                path='results/model_best_v8.pt',
+                metadata={
+                    'training_n_nodes': N,
+                    'training_h_avg': model.h_infer.item(),
+                    'stencil_k': config['stencil_k'],
+                    'projection_eps': config['projection_eps'],
+                }
+            )
+            # Also save legacy format for backward compatibility
             torch.save(model.state_dict(), 'results/model_best.pt')
 
         if (epoch + 1) % 10 == 0:
@@ -197,11 +214,27 @@ def train():
             _film_check(model, edge_index, device)
             _baseline_check(dataset, vel_w, device)
 
-    torch.save(model.state_dict(), 'results/model_final_v8.pt')      # نام canonical برای eval
+    # Save final checkpoint with resolution metadata
+    from src.utils.checkpoint import save_checkpoint
+    save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=config['epochs'],
+        loss=best_loss,
+        config=config,
+        path='results/model_final_v8.pt',
+        metadata={
+            'training_n_nodes': N,
+            'training_h_avg': model.h_infer.item(),
+            'stencil_k': config['stencil_k'],
+            'projection_eps': config['projection_eps'],
+        }
+    )
     torch.save(model.state_dict(), 'results/model_final.pt')   # نسخه‌ی مخصوص این آزمایش
     print(f"\nBest weighted loss: {best_loss:.4e} (با Hybrid Guidance)")
     print("✅ آموزش با Dual-Path Loss تمام شد")
-    print("سپس: python scripts/diagnostic_v3.py")
+    print("سپس: python scripts/diagnostic.py")
 
 
 def _baseline_check(dataset, vel_w, device):

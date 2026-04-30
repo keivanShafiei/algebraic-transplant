@@ -1,0 +1,38 @@
+```
+# Compiled Python files
+*.pyc
+__pycache__/
+
+# Dependencies
+venv/
+.venv/
+.env
+.env.local
+.env.*
+
+# Tests
+.pytest_cache/
+
+# Logs
+*.log
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Build/dist
+dist/
+build/
+target/
+
+# MyPy cache
+.mypy_cache/
+```
