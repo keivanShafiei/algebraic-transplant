@@ -103,6 +103,19 @@ def train():
     # =========================
     
     # خواندن یک بچ نمونه برای تشخیص دقیق بعد ورودی
+    print("📦 Loading Dataset...")
+    dataset = PhysicalDataset()
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        drop_last=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    print(f"   Dataset size: {len(dataset)}, Batch size: {config['batch_size']}")
+
     sample_mu, _, _, _, _ = next(iter(loader))
     actual_input_dim = sample_mu.shape[1]  # باید 1 باشد
     
@@ -175,15 +188,7 @@ def train():
     # =========================
     # Data
     # =========================
-    dataset = PhysicalDataset()
-    loader = DataLoader(
-        dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        drop_last=True,
-        num_workers=4,
-        pin_memory=True
-    )
+    
 
     vel_w, prs_w = compute_variance_weights(dataset, device)
 
