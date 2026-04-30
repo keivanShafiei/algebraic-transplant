@@ -112,11 +112,25 @@ def train():
     model.set_projection(G)
     
     # Wrap model with DataParallel for multi-GPU training
-    if use_multi_gpu:
-        model = nn.DataParallel(model)
-        model_module = model.module  # Access underlying module for set_points, etc.
+    base_model = NeuralOperator(
+        n_nodes=N,
+        in_channels=config['in_channels'],
+        hidden_channels=config['hidden_channels'],
+        out_channels=config['out_channels'],
+        num_layers=config['num_layers'],
+        stencil_k=config['stencil_k'],
+        re_conditioning=config.get('re_conditioning', True),
+        use_film=config.get('use_film', True),
+        fallback_strategy=config.get('fallback_strategy', 'hybrid')
+    ).to(device)
+    
+    # 2. سپس تصمیم بگیرید که DataParallel بپیچید یا نه
+    if use_multi_gpu and torch.cuda.device_count() > 1:
+        print(f"✅ Wrapping model with DataParallel ({torch.cuda.device_count()} GPUs)")
+        model = nn.DataParallel(base_model)
     else:
-        model_module = model
+        print("ℹ️ Using single GPU mode")
+        model = base_model
 
     # === Hybrid Manifold Guidance hyperparameters (قبل از هر پرینت) ===
     lambda_guidance = 0.1          # مقدار اولیه (قوی)
