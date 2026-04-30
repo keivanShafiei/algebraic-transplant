@@ -7,8 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import autocast, GradScaler
-
+from torch.amp import autocast, GradScaler  # جایگزین torch.cuda.amp
 from src.gnn.neural_operator import NeuralOperator
 from src.rbf_fd.stencils import build_stencils
 from src.data.cavity import generate_cavity_points
@@ -84,7 +83,8 @@ def variance_weighted_loss(pred: torch.Tensor, target: torch.Tensor,
 
 def train():
     config = yaml.safe_load(open('config.yaml'))
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     os.makedirs('results', exist_ok=True)
 
     # === Multi-GPU Setup: Use DataParallel if multiple GPUs available ===
@@ -92,8 +92,9 @@ def train():
     if use_multi_gpu:
         print(f"🚀 Using {torch.cuda.device_count()} GPUs with DataParallel")
         print(f"  GPU 0: {torch.cuda.get_device_name(0)}")
-        if torch.cuda.device_count() > 1:
-            print(f"  GPU 1: {torch.cuda.get_device_name(1)}")
+        #if torch.cuda.device_count() > 1:
+        #    print(f"  GPU 1: {torch.cuda.get_device_name(1)}")
+        print(f"💻 Running on Single GPU for stability: {device}")
     
     N        = config['n_nodes_list'][0]
     points   = generate_cavity_points(N).to(device)
@@ -155,7 +156,7 @@ def train():
     w_vel, w_prs, w_div = 1.0, config.get('w_pressure', 0.1), config.get('w_divergence', 0.01)
     
     # === Mixed Precision Training (AMP) Setup ===
-    scaler = GradScaler(enabled=True)  # Automatically disabled if CUDA not available
+    scaler = GradScaler('cuda', enabled=True)  # Automatically disabled if CUDA not available
 
     print(f"train_v8 | Hybrid Manifold Guidance (Dual-Path)")
     print(f"lambda_guidance start={lambda_guidance} → final=0.01 at epoch >= {lambda_milestone}")
@@ -187,7 +188,8 @@ def train():
             optimizer.zero_grad()
             
             # === Mixed Precision Forward Pass ===
-            with autocast(dtype=torch.float16):
+            with autocast('cuda', dtype=torch.float16):
+                outputs = model(mu, edge_index)
                 # Hybrid forward: همیشه a_hat_raw و a_NO_projected
                 a_hat, a_NO, b = model(mu, edge_index)
 
