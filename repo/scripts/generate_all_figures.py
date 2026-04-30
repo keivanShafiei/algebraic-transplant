@@ -45,7 +45,7 @@ def main() -> None:
     if os.path.exists(model_path) and os.path.isdir(sample_dir) and \
             any(f.endswith('.pt') for f in os.listdir(sample_dir)):
         print("[Fig 10] Projection efficacy (Algorithm 3 — using saved model and samples)")
-        from scripts.eval_projection import main as run_eval
+        from scripts.eval_projection import run_projection_eval
         run_eval == run_projection_eval(
             sample_dir=sample_dir,
             model_path=model_path,
