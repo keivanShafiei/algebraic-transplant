@@ -17,8 +17,13 @@ Prerequisites:
     data/samples/sample_*.pt — from RBF-FD solver (Algorithm 1, not yet impl.)
 """
 
-import os
-import sys
+import sys, os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # Ensure project root is on path when run as script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
