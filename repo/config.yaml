@@ -12,6 +12,7 @@ in_channels: 1            # اصلاح شده: 3 -> 1 (فقط پارامتر Re 
 hidden_channels: 64       # ابعاد لایه پنهان
 out_channels: 3           # خروجی: u, v, p
 num_layers: 4             # تعداد لایه‌های GNN
+hidden_dim: 128
 
 # --- Conditioning & Strategy ---
 re_conditioning: true     # فعال‌سازی شرطی‌سازی بر اساس عدد رینولدز
