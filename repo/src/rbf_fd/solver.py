@@ -4,30 +4,30 @@ Implements the **projection-based segregated solver** for steady laminar
 incompressible flows on a scattered RBF-FD point cloud. This solver has
 three roles in the Algebraic Transplant framework (Section 1):
 
-    (1) Data-generation engine: solves for (a, b) at each Re in the
-        training set, generating the labeled dataset for the GNN.
+ (1) Data-generation engine: solves for (a, b) at each Re in the
+     training set, generating the labeled dataset for the GNN.
 
-    (2) Source of transplanted operators: the interior-restricted divergence
-        operator G_int assembled here is the exact object transplanted into
-        the GNN projection layer. Using the solver's own G eliminates all
-        discretisation mismatch between the constraint enforced during
-        training and the constraint used at inference.
+ (2) Source of transplanted operators: the interior-restricted divergence
+     operator G_int assembled here is the exact object transplanted into
+     the GNN projection layer. Using the solver's own G eliminates all
+     discretisation mismatch between the constraint enforced during
+     training and the constraint used at inference.
 
-    (3) Warm-start target: the Neural Operator's prediction a_NO (which
-        satisfies G_int a_NO = 0 by construction) is used as the initial
-        guess for iterative refinement, reducing solver iterations by 4.2x
-        at Re = 500 (Table 13).
+ (3) Warm-start target: the Neural Operator's prediction a_NO (which
+     satisfies G_int a_NO = 0 by construction) is used as the initial
+     guess for iterative refinement, reducing solver iterations by 4.2x
+     at Re = 500 (Table 13).
 
 Fractional-step algorithm (Section 2.3, Eqs. 9-10)
----------------------------------------------------
-    Step 1 (Momentum solve):   K(a^n) a* = F
-    Step 2 (Pressure correction): L_int b^{n+1} = G_int a*
-    Step 3 (Velocity correction): a^{n+1} = a* - G_int^T b^{n+1}
+\-\-\-------------------------------------------------
+ Step 1 (Momentum solve): K(a^n) a* = F
+ Step 2 (Pressure correction): L_int b^{n+1} = G_int a*
+ Step 3 (Velocity correction): a^{n+1} = a* - G_int^T b^{n+1}
 
 By Theorem 1, Step 3 guarantees G_int a^{n+1} = 0 algebraically.
 
 True Algebraic Transplant — Interior Restriction (Section 4.9)
----------------------------------------------------------------
+\-\-\-------------------------------------------------------------
 The solver performs Steps 2-3 ONLY over interior DOFs (Proposition 4).
 Applying the correction over boundary nodes would corrupt prescribed
 Dirichlet velocities (the Boundary Condition Paradox) and produce ~74%
@@ -35,11 +35,11 @@ drag error. The interior-restricted operator G_int is stored as
 self.G_int and self.G_int_int.
 
 Data quality filters (Section 3.1)
------------------------------------
+\-\-\---------------------------------
 Only samples satisfying ALL of:
-    (i)   kappa(K) <= 1e6       (well-conditioned momentum operator)
-    (ii)  solver converged      (momentum AND divergence residuals met)
-    (iii) ||G_int a||_2 < tau_mass = 1e-4
+ (i) kappa(K) <= 1e6 (well-conditioned momentum operator)
+ (ii) solver converged (momentum AND divergence residuals met)
+ (iii) ||G_int a||_2 < tau_mass = 1e-4
 are saved by generate_data.py.
 """
 
@@ -59,8 +59,8 @@ def classify_cavity_nodes(
     """Classify nodes of the lid-driven cavity into lid / wall / interior.
 
     The domain is the unit square Omega = [0, 1]^2 with:
-        Lid (Gamma_D, moving): y = 1   (u = 1, v = 0)
-        Walls (Gamma_D, no-slip): x=0, x=1, y=0  (u = v = 0)
+        Lid (Gamma_D, moving): y = 1 (u = 1, v = 0)
+        Walls (Gamma_D, no-slip): x=0, x=1, y=0 (u = v = 0)
         Interior: all remaining nodes
 
     Parameters
@@ -95,9 +95,9 @@ def build_bc_rhs(
     """Construct the right-hand side vector F for the momentum equation.
 
     Encodes the boundary conditions:
-        Lid nodes:   F[2*i]   = 1.0  (u = 1, unit lid velocity)
-        Wall/lid v:  F[2*i+1] = 0.0  (v = 0 everywhere on boundary)
-        Interior:    F = 0           (no forcing in this benchmark)
+        Lid nodes: F[2*i] = 1.0 (u = 1, unit lid velocity)
+        Wall/lid v: F[2*i+1] = 0.0 (v = 0 everywhere on boundary)
+        Interior: F = 0 (no forcing in this benchmark)
 
     Returns
     -------
@@ -127,7 +127,7 @@ def assemble_momentum_operator(
     velocity components.
 
     Boundary rows enforce the Dirichlet condition via identity rows:
-        K[2*i, 2*i] = 1  for boundary node i.
+        K[2*i, 2*i] = 1 for boundary node i.
 
     Parameters
     ----------
@@ -224,7 +224,7 @@ class NavierStokesSolver:
 
         # Assemble all discrete operators
         self.G_full = assemble_divergence_operator(points, self.stencils, c)
-        self.G = self.G_full          # alias for downstream compatibility
+        self.G = self.G_full  # alias for downstream compatibility
         self.Gx = self.G_full[:, 0::2]
         self.Gy = self.G_full[:, 1::2]
         self.Phi = assemble_phi_stencil(points, self.stencils, c)
@@ -242,8 +242,8 @@ class NavierStokesSolver:
         self.interior_dof_mask[2 * int_idx + 1] = True
 
         # Interior-restricted operators (True Algebraic Transplant)
-        self.G_int = self.G_full[self.is_int]                     # (N_int, 2N)
-        self.G_int_int = self.G_int[:, self.interior_dof_mask]    # (N_int, 2*N_int)
+        self.G_int = self.G_full[self.is_int]  # (N_int, 2N)
+        self.G_int_int = self.G_int[:, self.interior_dof_mask]  # (N_int, 2*N_int)
 
         # Pre-factor L_int in float64 for O(10^-13) projection precision
         G64 = self.G_int_int.to(torch.float64)
@@ -260,7 +260,7 @@ class NavierStokesSolver:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Interior-restricted Helmholtz projection (Steps 2-3 of Algorithm 1).
 
-        Solves: L_int b = G_int a*  (float64)
+        Solves: L_int b = G_int a* (float64)
         Then:   a_new[interior] -= G_int_int^T b
 
         Boundary DOFs are untouched (Proposition 4 — boundary invariance).
@@ -334,6 +334,29 @@ class NavierStokesSolver:
         For Re > 200 the solver may require more iterations; n_max should
         be increased accordingly.
         """
+        # Input validation
+        if not isinstance(Re, (int, float)):
+            raise TypeError(f"Re must be numeric, got {type(Re)}")
+        if Re <= 0:
+            raise ValueError(f"Re must be positive, got {Re}")
+        if Re > 2000:
+            import warnings
+            warnings.warn(
+                f"Re={Re} is very high. Solver may not converge for steady laminar flow. "
+                f"Consider reducing Re or increasing n_max.",
+                UserWarning,
+            )
+
+        if tau_mom <= 0:
+            raise ValueError(f"tau_mom must be positive, got {tau_mom}")
+        if tau_mass <= 0:
+            raise ValueError(f"tau_mass must be positive, got {tau_mass}")
+        if n_max <= 0:
+            raise ValueError(f"n_max must be positive, got {n_max}")
+        if n_max > 10000:
+            import warnings
+            warnings.warn(f"n_max={n_max} is very large. This may be slow.", UserWarning)
+
         nu = 1.0 / Re
         a = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
         b_int = torch.zeros(
