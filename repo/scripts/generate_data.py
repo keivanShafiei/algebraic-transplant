@@ -1,14 +1,17 @@
-#generate_data.py 
-
+#generate_data.py
 
 import os
 import sys
 import argparse
 import time
+import logging
 import torch
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# NEW: Import logging
+from src.utils.logging_config import setup_logging, get_logger
 
 from src.data.cavity import generate_cavity_points
 from src.rbf_fd.stencils import build_stencils
@@ -31,6 +34,14 @@ def parse_args():
 
 
 def main():
+    # NEW: Setup logging
+    from datetime import datetime
+    logger = setup_logging(
+        log_dir="logs",
+        log_level=logging.INFO,
+        experiment_name=f"generate_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    )
+
     args = parse_args()
     config = yaml.safe_load(open('config.yaml'))
     device = torch.device(args.device)
@@ -39,28 +50,28 @@ def main():
 
     N = args.n
     points = generate_cavity_points(N).to(device)
-    print(f"Nodes N={N}, generating Ns={args.ns} samples (physical space, no normalization)")
-    print(f"Re ∈ [{args.re_min}, {args.re_max}]")
+    logger.info(f"Nodes N={N}, generating Ns={args.ns} samples")
+    logger.info(f"Re in [{args.re_min}, {args.re_max}]")
 
     t0 = time.time()
     solver = NavierStokesSolver(points, k=config['stencil_k'],
                                 eps=float(config['projection_eps']))
-    print(f"Solver precomputed in {time.time()-t0:.1f}s")
+    logger.info(f"Solver precomputed in {time.time()-t0:.1f}s")
 
     # =====================================================================
     # CRITICAL FIX (Task 1): Save correct G operators for projection layer
     # =====================================================================
     # OLD (BUGGY):
-    #   torch.save(solver.G, 'data/G.pt')        # G_full alias
-    #   torch.save(solver.G, 'data/fixed_G.pt')  # G_full alias — WRONG!
+    # torch.save(solver.G, 'data/G.pt')       # G_full alias
+    # torch.save(solver.G, 'data/fixed_G.pt') # G_full alias — WRONG!
     #
     # NEW (FIXED):
-    #   solver.G is an alias for solver.G_full (full-domain divergence operator)
-    #   solver.G_int is the interior-restricted operator (Proposition 4)
+    # solver.G is an alias for solver.G_full (full-domain divergence operator)
+    # solver.G_int is the interior-restricted operator (Proposition 4)
     #
     # Proposition 4 states: boundary DOFs are invariant under interior-restricted projection.
-    # Using G_full in projection corrupts Dirichlet velocities → ~74% drag error.
-    # Using G_int preserves boundaries → 3.363×10⁻⁵% drag error.
+    # Using G_full in projection corrupts Dirichlet velocities -> ~74% drag error.
+    # Using G_int preserves boundaries -> 3.363x10^-5% drag error.
     # =====================================================================
 
     # Save full-domain G for reference (optional, not used in projection)
@@ -72,7 +83,11 @@ def main():
     # Save interior DOF mask for boundary-safe projection
     torch.save(solver.interior_dof_mask, 'data/interior_mask.pt')
 
-    print("Saved data/G_full.pt, data/fixed_G.pt (G_int), data/interior_mask.pt")
+    # NEW: Save interior node mask for pressure recovery (Phase 2, Task 1)
+    interior_node_mask = solver.is_int  # (N,) boolean, True for interior nodes
+    torch.save(interior_node_mask, 'data/interior_node_mask.pt')
+
+    logger.info("Saved: data/G_full.pt, data/fixed_G.pt (G_int), data/interior_mask.pt, data/interior_node_mask.pt")
 
     # Compute global scale stats from a few samples for stable training
     re_values = torch.linspace(args.re_min, args.re_max, args.ns, dtype=torch.float32)
@@ -92,14 +107,14 @@ def main():
                 verbose=args.verbose,
             )
         except Exception as exc:
-            print(f" [SKIP] Re={re_val:.1f}: solver failed ({exc})")
+            logger.warning(f"[SKIP] Re={re_val:.1f}: solver failed ({exc})")
             rejected += 1
             continue
 
         # Use G_int (interior rows) for filtering, NOT G_full
         div_res = (solver.G_int @ a_ref).norm().item()
         if div_res > 5e-3:
-            print(f" [SKIP] Re={re_val:.1f}: div_res={div_res:.2e} > 5e-3")
+            logger.warning(f"[SKIP] Re={re_val:.1f}: div_res={div_res:.2e} > 5e-3")
             rejected += 1
             continue
 
@@ -125,12 +140,16 @@ def main():
             elapsed = time.time() - t_start
             rate = (idx + 1) / elapsed
             eta = (args.ns - idx - 1) / rate
-            print(f" [{idx+1:4d}/{args.ns}] Re={re_val:6.1f} "
-                  f"div={div_res:.2e} elapsed={elapsed:.0f}s ETA={eta:.0f}s")
+            logger.info(
+                f"[{idx+1:4d}/{args.ns}] Re={re_val:6.1f} "
+                f"div={div_res:.2e} elapsed={elapsed:.0f}s ETA={eta:.0f}s"
+            )
 
     total = time.time() - t_start
-    print(f"\nDataset complete. Accepted: {accepted}/{args.ns} ({100*accepted/args.ns:.1f}%)")
-    print(f"Total time: {total:.1f}s ({total/max(accepted,1):.2f}s/sample)")
+    logger.info(
+        f"Dataset complete. Accepted: {accepted}/{args.ns} ({100*accepted/args.ns:.1f}%)"
+    )
+    logger.info(f"Total time: {total:.1f}s ({total/max(accepted,1):.2f}s/sample)")
 
 
 if __name__ == '__main__':
