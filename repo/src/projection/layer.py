@@ -6,7 +6,7 @@ G[:, interior_mask] @ G[:, interior_mask].T, NOT from G @ G.T.
 
 Mathematical justification:
 - Without interior_mask: L = G @ G.T, q = L^{-1} @ G @ a_hat, a_NO = a_hat - G.T @ q
-- With interior_mask: L_int = G[:, interior] @ G[:, interior].T, 
+- With interior_mask: L_int = G[:, interior] @ G[:, interior].T,
   q = L_int^{-1} @ G @ a_hat, a_NO[interior] = a_hat[interior] - (G.T @ q)[interior]
 
 Using G @ G.T instead of G[:, interior] @ G[:, interior].T causes:
@@ -15,7 +15,7 @@ Using G @ G.T instead of G[:, interior] @ G[:, interior].T causes:
 - Idempotency violation (diff ~ 20 instead of ~0)
 - Pythagorean identity violation
 
-This fix ensures Proposition 4 (Boundary Invariance) AND Theorem 2 
+This fix ensures Proposition 4 (Boundary Invariance) AND Theorem 2
 (Divergence-Free Projection) are both satisfied.
 """
 
@@ -37,23 +37,65 @@ class HelmholtzProjection(nn.Module):
 
     Implements the Algebraic Transplant projection with interior restriction:
 
-    q = (G[:, interior]^T G[:, interior] + eps*I)^{-1} G a_hat       [float64 Cholesky]
-    a_NO = a_hat - G^T q                     [divergence-free output]
-      WHERE correction is applied ONLY to interior DOFs (Proposition 4)
-    p_corr = b_pred + q                      [via Eq. 18, external call]
+        q = (G[:, interior]^T G[:, interior] + eps*I)^{-1} G a_hat   [float64 Cholesky]
+        a_NO = a_hat - G^T q                                         [divergence-free output]
+        WHERE correction is applied ONLY to interior DOFs (Proposition 4)
+        p_corr = b_pred + q                                          [via Eq. 18, external call]
 
     CRITICAL FIX: The Cholesky factor is computed from G[:, interior_mask] @ G[:, interior_mask].T
     when interior_mask is provided. Previously, G @ G.T was used, which caused:
-    - div_norm ~ 1e+03 (should be ~4e-5)
-    - rho ~ 1e+01 (should be ~2e+05)
-    - Broken idempotency and Pythagorean identity
+        - div_norm ~ 1e+03 (should be ~4e-5)
+        - rho ~ 1e+01 (should be ~2e+05)
+        - Broken idempotency and Pythagorean identity
     """
 
     def __init__(self, G: torch.Tensor, eps: float = 1e-8,
                  interior_mask: torch.Tensor = None):
         super().__init__()
+
+        # Input validation
+        if not isinstance(G, torch.Tensor):
+            raise TypeError(f"G must be torch.Tensor, got {type(G)}")
+        if G.dim() != 2:
+            raise ValueError(f"G must be 2D, got shape {G.shape}")
+        if G.shape[0] > G.shape[1]:
+            raise ValueError(
+                f"G has more rows ({G.shape[0]}) than columns ({G.shape[1]}). "
+                f"Expected G to be (N_constraints, N_dof) with N_constraints <= N_dof."
+            )
+        if not torch.isfinite(G).all():
+            raise ValueError("G contains NaN or Inf values")
+
         self.eps = float(eps)
+        if self.eps <= 0:
+            raise ValueError(f"eps must be positive, got {eps}")
+
         self.register_buffer("G", G)
+
+        # Validate interior_mask
+        if interior_mask is not None:
+            if not isinstance(interior_mask, torch.Tensor):
+                raise TypeError(f"interior_mask must be torch.Tensor, got {type(interior_mask)}")
+            if interior_mask.dtype != torch.bool:
+                raise TypeError(f"interior_mask must be bool, got {interior_mask.dtype}")
+            expected_len = G.shape[1]
+            if interior_mask.shape[0] != expected_len:
+                raise ValueError(
+                    f"interior_mask length ({interior_mask.shape[0]}) must match "
+                    f"G columns ({expected_len})."
+                )
+            n_interior = interior_mask.sum().item()
+            if n_interior == 0:
+                raise ValueError("interior_mask has no True values; all DOFs are boundary")
+            if n_interior == expected_len:
+                import warnings
+                warnings.warn(
+                    "interior_mask marks ALL DOFs as interior. "
+                    "This is equivalent to full-domain projection. "
+                    "Use interior_mask=None for clarity.",
+                    UserWarning,
+                )
+
         self.interior_mask = interior_mask
 
         # CRITICAL FIX: Compute Cholesky from G[:, interior] @ G[:, interior].T
