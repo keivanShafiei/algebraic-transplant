@@ -13,7 +13,7 @@ Implements the four-stage NeuralOperator architecture described in Section 3.2:
 
  Stage 4: Algebraic Transplant Projection + Pressure Recovery
  a_NO = a_hat - G_int^T (G_int G_int^T + eps*I)^{-1} G_int a_hat (Eq. 16)
-   WHERE correction is applied ONLY to interior DOFs (Proposition 4)
+ WHERE correction is applied ONLY to interior DOFs (Proposition 4)
  p_corr = b_pred + q (Eq. 18)
 
 The key architectural invariant: the projection layer holds G as a frozen
@@ -22,7 +22,7 @@ No gradient flows into G. The network learns to produce a_hat that,
 after projection, best approximates the true divergence-free velocity.
 
 Hybrid Manifold Guidance (HMG) training (Section 3.5)
-----------------------------------------------------
+\-\-\--------------------------------------------------
 The training loss is:
 
  L(theta) = L_physics(theta) + lambda(e) * L_guidance(theta)
@@ -38,7 +38,7 @@ the differentiable Cholesky solve) and one from the pre-projection
 guidance loss (which provides a direct signal to the backbone).
 
 Paper reference
----------------
+\-\-\-------------
 Section 3.2 (Neural Operator Architecture), Eqs. (15)-(18).
 Section 3.5 (Hybrid Manifold Guidance Training), Eq. (21).
 Table 4 (GNN hyperparameters).
@@ -59,7 +59,7 @@ class FiLMConditioner(nn.Module):
     Maps a log-normalised Reynolds number to per-layer affine parameters
     (gamma, beta) used to modulate GNN node features:
 
-    x_mod = gamma * x + beta
+        x_mod = gamma * x + beta
 
     This enables Reynolds-number-conditional processing without modifying
     the graph structure. The cosine similarity between Re=10 and Re=100
@@ -86,8 +86,8 @@ class FiLMConditioner(nn.Module):
         # Initialise to near-identity: gamma ~ 1, beta ~ 0
         nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
         with torch.no_grad():
-            self.net[-1].bias[:hidden_dim].fill_(1.0)  # gamma bias = 1
-            self.net[-1].bias[hidden_dim:].fill_(0.0)  # beta bias = 0
+            self.net[-1].bias[:hidden_dim].fill_(1.0)   # gamma bias = 1
+            self.net[-1].bias[hidden_dim:].fill_(0.0)    # beta bias = 0
 
     def forward(
         self,
@@ -117,19 +117,19 @@ class NeuralOperator(nn.Module):
     The complete 4-stage architecture for mapping Re -> (a, b):
 
     mu (Re/Re_max) -> FiLM embed -> 4x GraphConvLayer -> decoders
-     -> Helmholtz projection
-     -> (a_NO, b_pred, q)
+                                      -> Helmholtz projection
+                                      -> (a_NO, b_pred, q)
 
     Usage
     -----
     After construction, ALWAYS call:
-    model.set_points(points, stencils)  # registers node coords
-    model.set_projection(G, interior_mask)  # transplants G_int from solver
+        model.set_points(points, stencils)          # registers node coords
+        model.set_projection(G, interior_mask)      # transplants G_int from solver
 
     Then the forward() call returns (a_hat_raw, a_NO_projected, b_pred).
     Physical pressure is recovered externally as: p_corr = b_pred + q,
     where q is obtained by calling:
-    a_NO, q = model.projection(a_hat, return_q=True)
+        a_NO, q = model.projection(a_hat, return_q=True)
 
     Parameters
     ----------
@@ -225,8 +225,50 @@ class NeuralOperator(nn.Module):
         points : torch.Tensor, shape (N, d).
         stencils : torch.Tensor or None, shape (N, k).
         """
+        if not isinstance(points, torch.Tensor):
+            raise TypeError(f"points must be torch.Tensor, got {type(points)}")
+        if points.dim() != 2:
+            raise ValueError(f"points must be 2D (N, d), got shape {points.shape}")
+        if points.shape[1] != self.d:
+            raise ValueError(
+                f"points dimension ({points.shape[1]}) must match model d ({self.d})"
+            )
+        if not torch.isfinite(points).all():
+            raise ValueError("points contains NaN or Inf")
+
+        # Check points are in reasonable range for unit square
+        if points.min() < -0.1 or points.max() > 1.1:
+            import warnings
+            warnings.warn(
+                f"points range [{points.min():.3f}, {points.max():.3f}] outside [0,1]^2. "
+                f"Expected unit square domain.",
+                UserWarning,
+            )
+
         self.points = points.detach().to(dtype=torch.float32)
+
         if stencils is not None:
+            if stencils.dim() != 2:
+                raise ValueError(f"stencils must be 2D (N, k), got shape {stencils.shape}")
+            if stencils.shape[0] != points.shape[0]:
+                raise ValueError(
+                    f"stencils rows ({stencils.shape[0]}) must match points ({points.shape[0]})"
+                )
+            if stencils.shape[1] != self.k:
+                raise ValueError(
+                    f"stencils columns ({stencils.shape[1]}) must match k ({self.k})"
+                )
+            if stencils.min() < 0 or stencils.max() >= points.shape[0]:
+                raise ValueError(
+                    f"stencil indices out of range [0, {points.shape[0]}). "
+                    f"Got min={stencils.min()}, max={stencils.max()}"
+                )
+            # Check for duplicate stencil entries
+            for i in range(stencils.shape[0]):
+                row = stencils[i]
+                if len(row.unique()) != len(row):
+                    raise ValueError(f"Duplicate indices in stencil row {i}")
+
             self._stencils = stencils.detach().to(dtype=torch.int64)
             h = self._compute_h_avg(self.points, self._stencils)
             self.h_infer = h.detach().to(dtype=torch.float32)
@@ -289,10 +331,12 @@ class NeuralOperator(nn.Module):
             return torch.tensor(1.0, dtype=torch.float32, device=device)
         return self.h_train / (self.h_infer + 1e-12)
 
-    # =====================================================================
-    # CRITICAL FIX (Phase 1, Task 2): set_projection now accepts interior_mask
-    # =====================================================================
-    def set_projection(self, G: torch.Tensor, interior_mask: torch.Tensor = None):
+    def set_projection(
+        self,
+        G: torch.Tensor,
+        interior_mask: torch.Tensor = None,
+        interior_node_mask: torch.Tensor = None,
+    ):
         """Transplant the discrete divergence operator G into the projection layer.
 
         Automatically selects HelmholtzProjection (dense Cholesky) for dense
@@ -311,6 +355,9 @@ class NeuralOperator(nn.Module):
             Boolean mask of shape (2N,) indicating interior DOFs.
             When provided, enables boundary-safe projection (Proposition 4).
             When None, falls back to legacy full-domain behavior (not recommended).
+        interior_node_mask : torch.Tensor, optional
+            Boolean mask of shape (N,) for pressure nodes.
+            When provided, enables pressure recovery mapping q from N_int to N.
         """
         if G.is_sparse:
             self.projection = SparseHelmholtzProjection(
@@ -320,6 +367,23 @@ class NeuralOperator(nn.Module):
             self.projection = HelmholtzProjection(
                 G=G, eps=self.eps, interior_mask=interior_mask
             )
+
+        if interior_node_mask is not None:
+            self.set_interior_node_mask(interior_node_mask)
+
+    def set_interior_node_mask(self, mask: torch.Tensor):
+        """Register interior NODE mask (N,) for pressure recovery.
+
+        The projection layer uses interior_dof_mask (2N,) for velocity DOFs.
+        For pressure recovery, we need interior_node_mask (N,) to map
+        q (N_int,) back to full N nodes.
+
+        Parameters
+        ----------
+        mask : torch.Tensor
+            Boolean mask of shape (N,), True for interior nodes.
+        """
+        self.register_buffer("interior_node_mask", mask.to(torch.bool))
 
     def set_interior_mask(self, mask: torch.Tensor):
         """Register interior DOF mask for boundary-safe projection.
@@ -381,12 +445,26 @@ class NeuralOperator(nn.Module):
             Raw pressure head, shape (B, N).
             Physical pressure: p_corr = b + q (use projection with return_q=True).
         """
-        mu = mu.view(-1).float()
-        batch_size = mu.shape[0]
-        mu_log = self._log_re_normalized(mu)
-
         if self.points.numel() == 0:
             raise RuntimeError("Call set_points(points, stencils) before forward().")
+
+        if self.projection is None and use_projection:
+            raise RuntimeError(
+                "Projection layer not set. Call set_projection(G, interior_mask) before forward()."
+            )
+
+        mu = mu.view(-1).float()
+        if torch.isnan(mu).any() or torch.isinf(mu).any():
+            raise ValueError("mu contains NaN or Inf")
+        if (mu < 0).any() or (mu > 1.5).any():  # Normalized Re should be in [0, 1.5] roughly
+            import warnings
+            warnings.warn(
+                f"mu values outside expected range [0, 1.5]: min={mu.min():.3f}, max={mu.max():.3f}",
+                UserWarning,
+            )
+
+        batch_size = mu.shape[0]
+        mu_log = self._log_re_normalized(mu)
 
         # Stage 1: encode (coordinates, Re) -> node features
         pts = self.points.unsqueeze(0).expand(batch_size, -1, -1)
@@ -420,3 +498,98 @@ class NeuralOperator(nn.Module):
             return a_hat, a_NO, b
         else:
             return a_hat, a_hat, b
+
+    def predict(
+        self,
+        mu: torch.Tensor,
+        edge_index: torch.Tensor,
+        return_raw: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict divergence-free velocity and pressure-corrected pressure.
+
+        This is the PRIMARY inference API for end-users. It returns the
+        physically meaningful fields: projected velocity a_NO and corrected
+        pressure p_corr = b_pred + q (Eq. 18).
+
+        Parameters
+        ----------
+        mu : torch.Tensor
+            Normalised Reynolds number, shape (B,) or scalar.
+        edge_index : torch.Tensor
+            GNN edge connectivity, shape (2, E).
+        return_raw : bool, optional
+            If True, also return raw (pre-projection) velocity a_hat and
+            raw pressure head b_pred for debugging.
+
+        Returns
+        -------
+        a_NO : torch.Tensor
+            Projected divergence-free velocity, shape (B, 2N).
+        p_corr : torch.Tensor
+            Pressure-consistent field, shape (B, N).
+            p_corr = b_pred + q where q is the projection Lagrange multiplier.
+        a_hat : torch.Tensor (only if return_raw=True)
+            Raw decoder velocity output before projection.
+        b_pred : torch.Tensor (only if return_raw=True)
+            Raw decoder pressure output.
+
+        Notes
+        -----
+        The pressure correction q is obtained from the projection solve:
+            q = (G_int G_int^T + eps*I)^{-1} G_int a_hat
+        and represents the discrete analogue of the pressure Poisson solve
+        in the fractional-step method (Algorithm 1, Step 2).
+
+        For engineering force evaluation, p_corr accuracy depends on upstream
+        velocity accuracy (Section 4.10, Proposition 4). At 13.75% velocity
+        error, drag error is ~30%; the pressure output should be interpreted
+        as structurally aligned, not engineering-grade.
+
+        Example
+        -------
+        >>> model.set_projection(G_int, interior_mask, interior_node_mask)
+        >>> a_NO, p_corr = model.predict(mu, edge_index)
+        >>> # For debugging: inspect raw vs projected
+        >>> a_NO, p_corr, a_hat, b_pred = model.predict(mu, edge_index, return_raw=True)
+        """
+        # Run forward pass to get raw outputs
+        a_hat, a_NO, b_pred = self.forward(mu, edge_index)
+
+        batch_size = mu.shape[0]
+        q_rows = []
+
+        # Extract q from projection for each sample in batch
+        for i in range(batch_size):
+            _, q_i = self.projection(a_hat[i], return_q=True)
+            q_rows.append(q_i)
+
+        q = torch.stack(q_rows, 0)  # (B, N_int) or (B, N)
+
+        # Pressure correction: p_corr = b_pred + q
+        # q has shape (B, N_int) if interior-restricted, but b_pred is (B, N)
+        # Need to map q back to full N nodes
+        if q.shape[1] != b_pred.shape[1]:
+            # Interior-restricted q: expand to full N nodes
+            q_full = torch.zeros_like(b_pred)
+            # q corresponds to interior nodes only
+            # We need to know which nodes are interior
+            # This requires storing interior_node_mask (N,) not just interior_dof_mask (2N,)
+            if hasattr(self, 'interior_node_mask') and self.interior_node_mask is not None:
+                q_full[:, self.interior_node_mask] = q
+            else:
+                # Fallback: if N_int == N (full domain), q is already full
+                if q.shape[1] == b_pred.shape[1]:
+                    q_full = q
+                else:
+                    raise RuntimeError(
+                        f"Cannot align q shape {q.shape} with b_pred shape {b_pred.shape}. "
+                        f"Set interior_node_mask via set_interior_node_mask()."
+                    )
+        else:
+            q_full = q
+
+        p_corr = b_pred + q_full
+
+        if return_raw:
+            return a_NO, p_corr, a_hat, b_pred
+        return a_NO, p_corr
