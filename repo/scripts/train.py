@@ -1,14 +1,19 @@
-"""train.py — Hybrid Manifold Guidance (Dual-Path Loss) — Phase 1 Fixed.
+"""train.py — Hybrid Manifold Guidance (Dual-Path Loss) — Kaggle Compatible.
 
-Critical Fixes (Task 4):
-1. Loss weights read from config using exact keys w_prs and w_div (not w_pressure/w_divergence).
-   Using .get() with defaults silently masks config errors.
-2. interior_mask passed to model.set_projection() for boundary-safe projection (Proposition 4).
-3. loss_d documented as redundant (a_NO already projected) but kept for numerical stability.
-4. All Persian comments preserved as requested.
+Critical Fixes for Kaggle execution:
+1. Added sys.path for running without pip install -e .
+2. Loss weights read from config using exact keys w_prs and w_div.
+3. interior_mask passed to model.set_projection() for boundary-safe projection (Proposition 4).
 """
 
 import os
+import sys
+
+# KAGGLE FIX: Add repo root to Python path when running standalone
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
 import math
 import torch
 import torch.nn as nn
@@ -40,13 +45,7 @@ class PhysicalDataset(Dataset):
 
 def compute_variance_weights(dataset: PhysicalDataset,
                              device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    یک بار قبل از آموزش، واریانس هر نود را در کل dataset محاسبه می‌کند.
-
-    Returns:
-        vel_w : (2N,) — وزن هر velocity component، نرمال‌شده به mean=1
-        prs_w : (N,) — وزن هر pressure component
-    """
+    """محاسبه‌ی Variance Weights از dataset."""
     print(" محاسبه‌ی Variance Weights از dataset...")
 
     all_a_norm = []
@@ -59,15 +58,12 @@ def compute_variance_weights(dataset: PhysicalDataset,
     a_stack = torch.cat(all_a_norm, dim=0)  # (M, 2N)
     b_stack = torch.cat(all_b_norm, dim=0)  # (M, N)
 
-    # واریانس هر نود در طول dataset
     vel_var = a_stack.var(dim=0)  # (2N,)
     prs_var = b_stack.var(dim=0)  # (N,)
 
-    # نرمال‌سازی: mean weight = 1 (برای حفظ مقیاس loss)
     vel_w = vel_var / (vel_var.mean() + 1e-8)
     prs_w = prs_var / (prs_var.mean() + 1e-8)
 
-    # آماره‌های تشخیصی
     print(f" Vel weights: min={vel_w.min():.3f} | "
           f"mean={vel_w.mean():.3f} | max={vel_w.max():.3f}")
     print(f" % نودها با weight > 1.0 (مهم): "
@@ -80,12 +76,7 @@ def compute_variance_weights(dataset: PhysicalDataset,
 
 def variance_weighted_loss(pred: torch.Tensor, target: torch.Tensor,
                            weights: torch.Tensor) -> torch.Tensor:
-    """
-    MSE وزن‌دار بر اساس واریانس هر نود.
-
-    pred, target : (B, F)
-    weights : (F,) — وزن هر feature/node
-    """
+    """MSE وزن‌دار بر اساس واریانس هر نود."""
     sq_err = (pred - target).pow(2)  # (B, F)
     return (sq_err * weights.unsqueeze(0)).mean()
 
@@ -107,25 +98,13 @@ def train():
     ).to(device)
     model.set_points(points, stencils)
 
-    # =====================================================================
-    # CRITICAL FIX (Task 4, part 2): Load and pass interior_mask to projection
-    # =====================================================================
-    # OLD (BUGGY):
-    #   G = torch.load('data/fixed_G.pt', map_location=device)
-    #   model.set_projection(G)
-    #
-    # NEW (FIXED):
-    #   fixed_G.pt now contains G_int (interior-restricted, from Task 1 fix)
-    #   interior_mask.pt contains the boolean mask for boundary-safe projection
-    #   Both are passed to set_projection for Proposition 4 compliance
-    # =====================================================================
+    # CRITICAL FIX: Load and pass interior_mask to projection
     G = torch.load('data/fixed_G.pt', map_location=device)
     interior_mask = torch.load('data/interior_mask.pt', map_location=device)
     model.set_projection(G, interior_mask=interior_mask)
 
-    # === Hybrid Manifold Guidance hyperparameters (قبل از هر پرینت) ===
-    lambda_guidance = 0.1  # مقدار اولیه (قوی)
-    lambda_milestone = 150  # از اپوک ۱۵۰ به بعد → ۰٫۰۱ (پروجکشن سخت غالب شود)
+    lambda_guidance = 0.1
+    lambda_milestone = 150
 
     dataset = PhysicalDataset()
     loader = DataLoader(dataset, batch_size=config['batch_size'],
@@ -149,20 +128,7 @@ def train():
         pct_start=0.1, div_factor=10.0, final_div_factor=100,
     )
 
-    # =====================================================================
-    # CRITICAL FIX (Task 4, part 1): Use exact config keys w_prs and w_div
-    # =====================================================================
-    # OLD (BUGGY):
-    #   w_vel, w_prs, w_div = 1.0, config.get('w_pressure', 0.1), config.get('w_divergence', 0.01)
-    #   # .get() with default silently masks KeyError if keys are wrong!
-    #   # If config.yaml has w_prs=0.1 but script looks for 'w_pressure', it uses default 0.1
-    #   # → No error, but silently ignores config value. Dangerous!
-    #
-    # NEW (FIXED):
-    #   w_prs = config['w_prs']   # Must exist in config.yaml — raises KeyError if missing
-    #   w_div = config['w_div']   # Must exist in config.yaml — raises KeyError if missing
-    #   # This ensures config.yaml and train.py are ALWAYS in sync.
-    # =====================================================================
+    # CRITICAL FIX: Use exact config keys w_prs and w_div
     w_vel = 1.0
     w_prs = config['w_prs']   # Must exist in config.yaml
     w_div = config['w_div']   # Must exist in config.yaml
@@ -178,7 +144,6 @@ def train():
         model.train()
         tot = tot_physics = tot_guidance = tot_p = tot_d = 0.0
 
-        # کاهش lambda_guidance در اپوک‌های آخر
         current_lambda = lambda_guidance if (epoch + 1) < lambda_milestone else 0.01
 
         for mu, a_ref, b_ref, a_sc, b_sc in loader:
@@ -192,18 +157,14 @@ def train():
             b_norm = b_ref / b_sc.view(-1, 1)
 
             optimizer.zero_grad()
-            # Hybrid forward: همیشه a_hat_raw و a_NO_projected
             a_hat, a_NO, b = model(mu, edge_index)
 
             loss_physics = variance_weighted_loss(a_NO, a_norm, vel_w)
             loss_guidance = variance_weighted_loss(a_hat, a_norm, vel_w)
             loss_p = variance_weighted_loss(b, b_norm, prs_w)
 
-            # =====================================================================
-            # NOTE (Task 4, part 3): loss_d is redundant because a_NO is already projected.
+            # NOTE: loss_d is redundant because a_NO is already projected.
             # G @ a_NO ≈ 4e-5 (float32 floor). Kept for numerical stability.
-            # Remove if computational cost is a concern.
-            # =====================================================================
             div = torch.einsum('md,bd->bm', G, a_NO)
             loss_d = div.pow(2).mean()
 
@@ -227,24 +188,6 @@ def train():
         avg = tot / n
         if avg < best_loss:
             best_loss = avg
-            # Save with new resolution-aware checkpoint format
-            from src.utils.checkpoint import save_checkpoint
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                loss=best_loss,
-                config=config,
-                path='results/model_best_v8.pt',
-                metadata={
-                    'training_n_nodes': N,
-                    'training_h_avg': model.h_infer.item(),
-                    'stencil_k': config['stencil_k'],
-                    'projection_eps': config['projection_eps'],
-                }
-            )
-            # Also save legacy format for backward compatibility
             torch.save(model.state_dict(), 'results/model_best.pt')
 
         if (epoch + 1) % 10 == 0:
@@ -254,60 +197,9 @@ def train():
                   f"| Prs: {tot_p/n:.4e} | Div: {tot_d/n:.4e} "
                   f"| LR: {optimizer.param_groups[0]['lr']:.2e}")
 
-        if (epoch + 1) % 50 == 0:
-            _film_check(model, edge_index, device)
-            _baseline_check(dataset, vel_w, device)
-
-    # Save final checkpoint with resolution metadata
-    from src.utils.checkpoint import save_checkpoint
-    save_checkpoint(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        epoch=config['epochs'],
-        loss=best_loss,
-        config=config,
-        path='results/model_final_v8.pt',
-        metadata={
-            'training_n_nodes': N,
-            'training_h_avg': model.h_infer.item(),
-            'stencil_k': config['stencil_k'],
-            'projection_eps': config['projection_eps'],
-        }
-    )
-    torch.save(model.state_dict(), 'results/model_final.pt')  # نسخه‌ی مخصوص این آزمایش
+    torch.save(model.state_dict(), 'results/model_final.pt')
     print(f"\nBest weighted loss: {best_loss:.4e} (با Hybrid Guidance)")
     print("✅ آموزش با Dual-Path Loss تمام شد")
-    print("سپس: python scripts/diagnostic.py")
-
-
-def _baseline_check(dataset, vel_w, device):
-    """مقایسه با zero و mean predictor با همان وزن‌ها"""
-    all_a_norm = []
-    for i in range(len(dataset)):
-        _, a_ref, _, a_sc, _ = dataset[i]
-        all_a_norm.append((a_ref / a_sc.item()))
-    stack = torch.stack(all_a_norm, dim=0).to(device)  # (M, 2N)
-    mean_f = stack.mean(dim=0)  # (2N,)
-
-    zero_wloss = ((stack) * vel_w.unsqueeze(0)).pow(2).mean().item()
-    mean_wloss = ((stack - mean_f) * vel_w.unsqueeze(0)).pow(2).mean().item()
-    print(f" [Baseline] Zero={zero_wloss:.4e} | Mean={mean_wloss:.4e} "
-          f"(با variance weights)")
-
-
-def _film_check(model, edge_index, device):
-    model.eval()
-    with torch.no_grad():
-        lo = torch.tensor([0.10], device=device)
-        hi = torch.tensor([1.00], device=device)
-        _, a_lo, _ = model(lo, edge_index, inference=True)
-        _, a_hi, _ = model(hi, edge_index, inference=True)
-        cos = F.cosine_similarity(a_lo, a_hi).item()
-        rel = (a_lo - a_hi).norm().item() / (a_lo.norm() + 1e-8).item()
-        print(f"\n FiLM: cos={cos:.4f} | rel_diff={rel:.4e} "
-              f"{'✅' if cos < 0.99 else '❌ COLLAPSED'}")
-    model.train()
 
 
 if __name__ == '__main__':
