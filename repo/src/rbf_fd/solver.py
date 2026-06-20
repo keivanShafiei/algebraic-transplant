@@ -19,7 +19,7 @@ three roles in the Algebraic Transplant framework (Section 1):
      at Re = 500 (Table 13).
 
 Fractional-step algorithm (Section 2.3, Eqs. 9-10)
-\-\-\-------------------------------------------------
+---------------------------------------------------------------
  Step 1 (Momentum solve): K(a^n) a* = F
  Step 2 (Pressure correction): L_int b^{n+1} = G_int a*
  Step 3 (Velocity correction): a^{n+1} = a* - G_int^T b^{n+1}
@@ -27,7 +27,7 @@ Fractional-step algorithm (Section 2.3, Eqs. 9-10)
 By Theorem 1, Step 3 guarantees G_int a^{n+1} = 0 algebraically.
 
 True Algebraic Transplant — Interior Restriction (Section 4.9)
-\-\-\-------------------------------------------------------------
+---------------------------------------------------------------
 The solver performs Steps 2-3 ONLY over interior DOFs (Proposition 4).
 Applying the correction over boundary nodes would corrupt prescribed
 Dirichlet velocities (the Boundary Condition Paradox) and produce ~74%
@@ -35,7 +35,7 @@ drag error. The interior-restricted operator G_int is stored as
 self.G_int and self.G_int_int.
 
 Data quality filters (Section 3.1)
-\-\-\---------------------------------
+---------------------------------------------------------------
 Only samples satisfying ALL of:
  (i) kappa(K) <= 1e6 (well-conditioned momentum operator)
  (ii) solver converged (momentum AND divergence residuals met)
