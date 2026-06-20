@@ -384,7 +384,7 @@ The Algebraic Transplant is a **necessary but not sufficient** condition for eng
              Architectures: Numerically Consistent Neural Operators for Parametric 
              Incompressible Flows},
   author  = {Shafiei, Amirkeivan and Mosavi Nezhad, Seyed Mojtaba},
-  journal = {Preprint submitted to Journal of Computational Physics},
+  journal = {},
   year    = {2026},
   note    = {University of Birjand}
 }
