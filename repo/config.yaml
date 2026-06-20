@@ -1,43 +1,45 @@
-# config.yaml
-# تنظیمات بهینه‌شده برای دو کارت Tesla T4 و داده‌های تک‌بعدی (فقط Reynolds Number)
+# config.yaml — Hyperparameters matching Table 4 of the paper
+# SINGLE SOURCE OF TRUTH: All scripts must read from this file.
+# NOTE: Do NOT change these without updating Table 4 in the paper.
+# The paper's results were produced with these exact values.
 
 # --- Geometry & Resolution ---
-n_nodes_list: [225]       # رزولوشن آموزش (15x15 grid). برای تست رزولوشن‌های دیگر اضافه کنید.
-stencil_k: 25             # تعداد همسایگان در استنسیل RBF-FD
+n_nodes_list: [225]           # Training resolution (15×15 grid)
+stencil_k: 25                 # k-NN neighbours for RBF-FD stencil
 
-# --- Model Architecture ---
-# توجه: مقدار in_channels باید با بعد ورودی mu در داده‌های شما مطابقت داشته باشد.
-# چون خطا نشان داد mu.shape=[16, 1]، این مقدار را به 1 تغییر می‌دهیم.
-in_channels: 1            # اصلاح شده: 3 -> 1 (فقط پارامتر Re وارد می‌شود)
-hidden_channels: 64       # ابعاد لایه پنهان
-out_channels: 3           # خروجی: u, v, p
-num_layers: 4             # تعداد لایه‌های GNN
-hidden_dim: 128
-gnn_layers: 6
+# --- Model Architecture (Table 4) ---
+hidden_dim: 64                # Paper Table 4: hidden dimension
+gnn_layers: 4                 # Paper Table 4: message-passing layers
+projection_eps: 1.0e-8        # Paper Table 4: Tikhonov regularisation
 
-# --- Conditioning & Strategy ---
-re_conditioning: true     # فعال‌سازی شرطی‌سازی بر اساس عدد رینولدز
-use_film: true            # استفاده از لایه FiLM برای تزریق شرط
-fallback_strategy: 'hybrid' # استراتژی fallback (hybrid, pure_gnn, pure_mlp)
-
-# --- Training Hyperparameters ---
-batch_size: 16            # اندازه بچ (مناسب برای 2 کارت T4 با Mixed Precision)
-epochs: 200               # تعداد اپوک‌های آموزش
-lr: 0.001                 # نرخ یادگیری اولیه
-weight_decay: 1e-4        # وزن جریمه L2
-
-# --- Optimization Flags ---
-use_multi_gpu: true       # فعال‌سازی DataParallel برای 2 GPU
-amp_enabled: true         # فعال‌سازی Mixed Precision (AMP)
+# --- Training Hyperparameters (Table 4) ---
+batch_size: 16
+epochs: 200
+lr: 0.001                     # Initial learning rate
+weight_decay: 1e-4
 
 # --- Loss Weights ---
-w_vel: 1.0                # وزن ضرر سرعت
-w_prs: 0.1                # وزن ضرر فشار
-w_div: 0.01               # وزن ضرر واگرایی (فیزیکی)
+w_vel: 1.0                    # Velocity loss weight
+w_prs: 0.1                    # Pressure loss weight (key: w_prs, NOT w_pressure)
+w_div: 0.01                   # Divergence auxiliary weight (key: w_div, NOT w_divergence)
 
 # --- Numerical Stability ---
-projection_eps: 1e-06
+dtype: float32                # Inference precision (Remark 2)
+operator_assembly_dtype: float64  # Assembly precision (Remark 2)
+
+# --- Hardware ---
+device: cuda                  # NVIDIA RTX 4090 (Table 4)
+random_seeds: [42, 123, 456, 789, 1024]  # For reproducibility
 
 # --- Checkpointing ---
-save_freq: 10             # ذخیره چک‌پوینت هر چند اپوک
-results_dir: 'results'    # پوشه خروجی
+save_freq: 10
+results_dir: 'results'
+
+# --- Legacy / Backward Compatibility (kept but not used by paper scripts) ---
+in_channels: 1                # Parameter dimension (Re only)
+out_channels: 3               # Output: u, v, p
+num_layers: 4                  # Alias for gnn_layers (deprecated)
+hidden_channels: 64            # Alias for hidden_dim (deprecated)
+use_film: true                # FiLM conditioning enabled
+re_conditioning: true          # Reynolds-number conditioning
+fallback_strategy: 'hybrid'    # Adaptive solver fallback
