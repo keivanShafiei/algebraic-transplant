@@ -1,17 +1,24 @@
-"""eval_projection_fixed.py — کاملاً سازگار با مدل جدید"""
+"""eval_projection.py — Projection Efficacy Evaluation — Kaggle Compatible."""
+
 import os
+import sys
+
+# KAGGLE FIX: Add repo root to Python path when running standalone
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
 import torch
 import yaml
 from src.gnn.neural_operator import NeuralOperator
 from src.data.cavity import generate_cavity_points
 from src.rbf_fd.stencils import build_stencils
-from src.utils.metrics import divergence_residual
+
+
 def run_projection_eval(sample_dir: str,
                         model_path: str,
                         n_test: int = 80):
-    """
-    Core evaluation function (usable by pipelines)
-    """
+    """Core evaluation function (usable by pipelines)"""
 
     config = yaml.safe_load(open('config.yaml'))
     device = torch.device('cpu')
@@ -22,6 +29,7 @@ def run_projection_eval(sample_dir: str,
     points = generate_cavity_points(N).to(device)
     stencils = build_stencils(points, k).to(device)
     G = torch.load('data/fixed_G.pt', map_location=device)
+    interior_mask = torch.load('data/interior_mask.pt', map_location=device)
 
     edge_dst = stencils.reshape(-1)
     edge_src = torch.arange(N, device=device).repeat_interleave(k)
@@ -36,7 +44,7 @@ def run_projection_eval(sample_dir: str,
 
     model.set_points(points, stencils)
     model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
-    model.set_projection(G)
+    model.set_projection(G, interior_mask=interior_mask)
     model.eval()
 
     rb, ra, rhos = [], [], []
@@ -63,18 +71,19 @@ def run_projection_eval(sample_dir: str,
             rhos.append(rho)
 
     return rb, ra, rhos
+
+
 def main():
     rb, ra, rhos = run_projection_eval(
         sample_dir='data/samples',
         model_path='results/model_final.pt'
     )
 
-    import torch
-
     print("=== Table 8: Projection Layer Efficacy (after fix) ===")
     print(f"r_before : {torch.tensor(rb).mean():.2e} ± {torch.tensor(rb).std():.2e}")
     print(f"r_after  : {torch.tensor(ra).mean():.2e} ± {torch.tensor(ra).std():.2e}")
     print(f"ρ        : {torch.tensor(rhos).mean():.2e} ± {torch.tensor(rhos).std():.2e}")
+
 
 if __name__ == '__main__':
     main()
