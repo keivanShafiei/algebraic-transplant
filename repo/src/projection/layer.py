@@ -1,23 +1,25 @@
-"""projection/layer.py — Differentiable Helmholtz Projection Layers.
+"""projection/layer.py — Differentiable Helmholtz Projection Layers (Phase 1 Fixed).
 
-This module implements the core Algebraic Transplant projection:
+This module implements the core Algebraic Transplant projection with
+boundary-safe interior restriction (Proposition 4):
 
-    q   = (G G^T + eps*I)^{-1} G a_hat          (Lagrange multiplier)
-    a_NO = a_hat - G^T q                         (divergence-free velocity)
-    p_corr = b_pred + q                          (physical pressure, Eq. 18)
+ q = (G_int G_int^T + eps*I)^{-1} G_int a_hat     (Lagrange multiplier)
+ a_NO = a_hat - G_int^T q                         (divergence-free velocity)
+   WHERE correction is applied ONLY to interior DOFs
+ p_corr = b_pred + q                              (physical pressure, Eq. 18)
 
 Two implementations are provided:
 
 HelmholtzProjection (dense Cholesky)
-    Suitable for N up to ~10,000. Factorises L = G G^T + eps*I in float64
-    at construction time, then each forward call is a back-substitution.
-    Achieves eps_div ~ O(10^-13) in float64, ~ 4e-5 in float32 inference
-    (Remark 2, Table 9).
+ Suitable for N up to ~10,000. Factorises L = G_int G_int^T + eps*I in float64
+ at construction time, then each forward call is a back-substitution.
+ Achieves eps_div ~ O(10^-13) in float64, ~ 4e-5 in float32 inference
+ (Remark 2, Table 9).
 
 SparseHelmholtzProjection (Jacobi-PCG)
-    Suitable for N up to 100,000+ (validated at N=100,000: 3.08 s, 0.45 GB
-    VRAM, eps_div < 1.89e-4, Section 3.4 and Table 17).
-    Matrix-free: only sparse mat-vec products. O(N) working memory.
+ Suitable for N up to 100,000+ (validated at N=100,000: 3.08 s, 0.45 GB
+ VRAM, eps_div < 1.89e-4, Section 3.4 and Table 17).
+ Matrix-free: only sparse mat-vec products. O(N) working memory.
 
 Both classes implement the same interface: forward(a_hat, return_q=False).
 
@@ -25,20 +27,29 @@ Paper reference
 ---------------
 Theorem 2 (Discrete Helmholtz Projection), Section 2.3, Eq. (11):
 
-    P_div(a_hat) := a_hat - G^T (L + eps*I)^{-1} G a_hat
+ P_div(a_hat) := a_hat - G^T (L + eps*I)^{-1} G a_hat
+
+Proposition 4 (Boundary Invariance), Section 4.9:
+ For all boundary DOFs i ∈ I_∂:
+   [P_div^int(a_hat)]_i = a_hat_i    (to machine precision)
 
 Properties verified by tests/test_projection.py:
-    (1) ||G P_div(a_hat)||_2 <= eps ||G a_hat||_2 / sigma_min(L)
-    (2) P_div minimises ||v - a_hat|| subject to G v = 0  (Pythagorean identity)
-    (3) P_div is differentiable (Jacobian eigenvalues in {0,1} to O(eps))
-    (+) P_div is idempotent: P_div(P_div(a)) = P_div(a)
+ (1) ||G P_div(a_hat)||_2 <= eps ||G a_hat||_2 / sigma_min(L)
+ (2) P_div minimises ||v - a_hat|| subject to G v = 0 (Pythagorean identity)
+ (3) P_div is differentiable (Jacobian eigenvalues in {0,1} to O(eps))
+ (+) P_div is idempotent: P_div(P_div(a)) = P_div(a)
 
 True Algebraic Transplant (Section 4.9, Proposition 4)
--------------------------------------------------------
+------------------------------------------------------
 For boundary-safe projection, G must be the **interior-restricted** operator
 G_int (rows corresponding to interior nodes only). Using the full-domain
 G_full corrupts Dirichlet boundary velocities and produces ~74% drag error.
 The NavierStokesSolver automatically exposes solver.G_int for this purpose.
+
+CRITICAL FIX (Phase 1, Task 2): interior_mask parameter added to both classes.
+When interior_mask is provided, the correction is applied ONLY to interior DOFs,
+preserving Dirichlet boundary conditions exactly (Proposition 4).
+When interior_mask is None, falls back to legacy full-domain behavior (not recommended).
 """
 
 from __future__ import annotations
@@ -55,13 +66,14 @@ def _as_column(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
 
 
 class HelmholtzProjection(nn.Module):
-    """Dense Cholesky-based Helmholtz projection layer.
+    """Dense Cholesky-based Helmholtz projection layer with boundary-safe masking.
 
-    Implements the Algebraic Transplant projection:
+    Implements the Algebraic Transplant projection with interior restriction:
 
-        q    = (G G^T + eps*I)^{-1} G a_hat    [float64 Cholesky solve]
-        a_NO = a_hat - G^T q                    [divergence-free output]
-        p_corr = b_pred + q                     [via Eq. 18, external call]
+    q = (G G^T + eps*I)^{-1} G a_hat       [float64 Cholesky solve]
+    a_NO = a_hat - G^T q                     [divergence-free output]
+      WHERE correction is applied ONLY to interior DOFs (Proposition 4)
+    p_corr = b_pred + q                      [via Eq. 18, external call]
 
     The Cholesky factorisation of L = G G^T + eps*I is pre-computed in
     float64 at construction time and stored as a buffer. Each forward
@@ -77,6 +89,11 @@ class HelmholtzProjection(nn.Module):
     eps : float, optional
         Tikhonov regularisation. Default 1e-8 (Table 4 of the paper).
         A small jitter of 1e-7 is added internally for Cholesky stability.
+    interior_mask : torch.Tensor, optional
+        Boolean mask of shape (2N,) indicating interior DOFs.
+        When provided, correction is applied ONLY to interior DOFs,
+        preserving Dirichlet boundary values (Proposition 4).
+        When None, falls back to full-domain correction (legacy, not recommended).
 
     Attributes
     ----------
@@ -85,19 +102,27 @@ class HelmholtzProjection(nn.Module):
     chol : torch.Tensor
         Registered buffer holding the lower Cholesky factor of
         L + eps*I in float64.
+    interior_mask : torch.Tensor or None
+        Boundary-safe mask. If None, full-domain correction is applied.
 
     Notes
     -----
     Precision hierarchy (Remark 2):
-    - Cholesky factorisation: float64 -> eps_div ~ O(10^-13)
-    - forward() is called with float32 a_hat in training -> eps_div ~ 4e-5
-    This is arithmetic, not a design flaw.
+      - Cholesky factorisation: float64 -> eps_div ~ O(10^-13)
+      - forward() is called with float32 a_hat in training -> eps_div ~ 4e-5
+      This is arithmetic, not a design flaw.
+
+    CRITICAL FIX (Phase 1, Task 2):
+      Added interior_mask parameter. When provided, the correction vector
+      is masked so that boundary DOFs remain unchanged, satisfying Proposition 4.
     """
 
-    def __init__(self, G: torch.Tensor, eps: float = 1e-8):
+    def __init__(self, G: torch.Tensor, eps: float = 1e-8,
+                 interior_mask: torch.Tensor = None):
         super().__init__()
         self.eps = float(eps)
         self.register_buffer("G", G)
+        self.interior_mask = interior_mask  # NEW: mask for boundary-safe projection
 
         N_nodes = G.shape[0]
         jitter = 1.0e-7
@@ -114,6 +139,9 @@ class HelmholtzProjection(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Project a_hat onto the discrete divergence-free manifold.
 
+        CRITICAL FIX: When interior_mask is provided, correction is applied
+        ONLY to interior DOFs, preserving boundary values (Proposition 4).
+
         Parameters
         ----------
         a_hat : torch.Tensor
@@ -128,6 +156,7 @@ class HelmholtzProjection(nn.Module):
         -------
         a_NO : torch.Tensor
             Divergence-free velocity, same shape as a_hat.
+            Boundary DOFs are unchanged when interior_mask is provided.
         q : torch.Tensor (only if return_q=True)
             Pressure correction vector, shape (N_rows,) or (N_rows, B).
         """
@@ -138,7 +167,13 @@ class HelmholtzProjection(nn.Module):
         q = q64.to(a_col.dtype)
 
         correction = self.G.T @ q
-        a_NO = a_col - correction
+
+        # NEW (Phase 1, Task 2): Apply correction ONLY to interior DOFs (Proposition 4)
+        if self.interior_mask is not None:
+            a_NO = a_col.clone()
+            a_NO[self.interior_mask] -= correction[self.interior_mask]
+        else:
+            a_NO = a_col - correction  # Fallback: full-domain (not recommended)
 
         a_NO = a_NO.squeeze(-1) if squeezed else a_NO
         q = q.squeeze(-1) if squeezed else q
@@ -157,12 +192,12 @@ class SparseHelmholtzProjection(nn.Module):
     (diagonal) preconditioner M = diag(G G^T + eps*I).
 
     Complexity comparison:
-        HelmholtzProjection  : O(N^2) memory (dense Cholesky factor)
-        SparseHelmholtzProjection: O(N) memory (only sparse G + diagonal M)
+      HelmholtzProjection : O(N^2) memory (dense Cholesky factor)
+      SparseHelmholtzProjection: O(N) memory (only sparse G + diagonal M)
 
     Empirical results (Section 3.4, Table 17):
-        N = 100,000 nodes: 3.08 s, 0.45 GB peak VRAM, eps_div < 1.89e-4
-        N =  49,207 (cylinder): 528 iterations, eps_div < 1e-4
+      N = 100,000 nodes: 3.08 s, 0.45 GB peak VRAM, eps_div < 1.89e-4
+      N = 49,207 (cylinder): 528 iterations, eps_div < 1e-4
 
     The PCG replacement is architecturally invariant (Remark 6): G is still
     transplanted exactly, the null space is unchanged, and l2-optimality
@@ -180,6 +215,13 @@ class SparseHelmholtzProjection(nn.Module):
     max_iter : int, optional
         Maximum CG iterations. Default 1500. For N=100,000, convergence
         to 1e-4 requires ~1800 iterations (Figure 9 of the paper).
+    interior_mask : torch.Tensor, optional
+        Boolean mask of shape (2N,) indicating interior DOFs.
+        When provided, correction is applied ONLY to interior DOFs
+        (Proposition 4). When None, falls back to full-domain correction.
+
+    CRITICAL FIX (Phase 1, Task 2):
+      Added interior_mask parameter for boundary-safe projection.
     """
 
     def __init__(
@@ -188,6 +230,7 @@ class SparseHelmholtzProjection(nn.Module):
         eps: float = 1e-8,
         tol: float = 1e-5,
         max_iter: int = 1500,
+        interior_mask: torch.Tensor = None,
     ):
         super().__init__()
         if not G.is_sparse:
@@ -195,6 +238,7 @@ class SparseHelmholtzProjection(nn.Module):
         self.eps = float(eps)
         self.tol = float(tol)
         self.max_iter = int(max_iter)
+        self.interior_mask = interior_mask  # NEW: mask for boundary-safe projection
 
         G = G.coalesce()
         self.register_buffer("G", G)
@@ -261,6 +305,9 @@ class SparseHelmholtzProjection(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Project a_hat onto the discrete divergence-free manifold (PCG).
 
+        CRITICAL FIX: When interior_mask is provided, correction is applied
+        ONLY to interior DOFs, preserving boundary values (Proposition 4).
+
         Parameters
         ----------
         a_hat : torch.Tensor
@@ -272,6 +319,7 @@ class SparseHelmholtzProjection(nn.Module):
         -------
         a_NO : torch.Tensor
             Divergence-free velocity, same shape as a_hat.
+            Boundary DOFs are unchanged when interior_mask is provided.
         q : torch.Tensor (only if return_q=True)
             Pressure correction vector.
         """
@@ -282,7 +330,12 @@ class SparseHelmholtzProjection(nn.Module):
         q_col, _ = _as_column(q)
         correction = torch.sparse.mm(self.GT, q_col)
 
-        a_NO = a_col - correction
+        # NEW (Phase 1, Task 2): Apply correction ONLY to interior DOFs
+        if self.interior_mask is not None:
+            a_NO = a_col.clone()
+            a_NO[self.interior_mask] -= correction[self.interior_mask]
+        else:
+            a_NO = a_col - correction
 
         a_NO = a_NO.squeeze(-1) if squeezed else a_NO
         q = q.squeeze(-1) if squeezed else q
