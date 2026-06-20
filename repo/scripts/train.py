@@ -4,10 +4,13 @@ Critical Fixes for Kaggle execution:
 1. Added sys.path for running without pip install -e .
 2. Loss weights read from config using exact keys w_prs and w_div.
 3. interior_mask passed to model.set_projection() for boundary-safe projection (Proposition 4).
+4. Added interior_node_mask for pressure recovery (Phase 2, Task 1).
+5. Replaced print() with structured logging (Phase 2, Task 3).
 """
 
 import os
 import sys
+from datetime import datetime
 
 # KAGGLE FIX: Add repo root to Python path when running standalone
 _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,12 +18,16 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 import math
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader, Dataset
+
+# NEW: Import logging
+from src.utils.logging_config import setup_logging, get_logger
 
 from src.gnn.neural_operator import NeuralOperator
 from src.rbf_fd.stencils import build_stencils
@@ -44,9 +51,10 @@ class PhysicalDataset(Dataset):
 
 
 def compute_variance_weights(dataset: PhysicalDataset,
-                             device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """محاسبه‌ی Variance Weights از dataset."""
-    print(" محاسبه‌ی Variance Weights از dataset...")
+                             device: torch.device,
+                             logger: logging.Logger) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute variance weights from dataset."""
+    logger.info("Computing variance weights from dataset...")
 
     all_a_norm = []
     all_b_norm = []
@@ -64,26 +72,44 @@ def compute_variance_weights(dataset: PhysicalDataset,
     vel_w = vel_var / (vel_var.mean() + 1e-8)
     prs_w = prs_var / (prs_var.mean() + 1e-8)
 
-    print(f" Vel weights: min={vel_w.min():.3f} | "
-          f"mean={vel_w.mean():.3f} | max={vel_w.max():.3f}")
-    print(f" % نودها با weight > 1.0 (مهم): "
-          f"{(vel_w > 1.0).float().mean().item()*100:.1f}%")
-    print(f" % نودها با weight < 0.1 (بی‌اهمیت): "
-          f"{(vel_w < 0.1).float().mean().item()*100:.1f}%\n")
+    logger.info(
+        f"Velocity weights — min: {vel_w.min():.3f}, "
+        f"mean: {vel_w.mean():.3f}, max: {vel_w.max():.3f}"
+    )
+    logger.info(
+        f"Important nodes (weight > 1.0): {(vel_w > 1.0).float().mean().item()*100:.1f}%"
+    )
+    logger.info(
+        f"Unimportant nodes (weight < 0.1): {(vel_w < 0.1).float().mean().item()*100:.1f}%"
+    )
 
     return vel_w.to(device), prs_w.to(device)
 
 
 def variance_weighted_loss(pred: torch.Tensor, target: torch.Tensor,
                            weights: torch.Tensor) -> torch.Tensor:
-    """MSE وزن‌دار بر اساس واریانس هر نود."""
+    """Variance-weighted MSE."""
     sq_err = (pred - target).pow(2)  # (B, F)
     return (sq_err * weights.unsqueeze(0)).mean()
 
 
 def train():
+    # NEW: Setup logging at the start
+    logger = setup_logging(
+        log_dir="results/logs",
+        log_level=logging.INFO,
+        experiment_name=f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    )
+    logger.info("=" * 60)
+    logger.info("RBF-FD GNN Projection — Training Started")
+    logger.info("=" * 60)
+
     config = yaml.safe_load(open('config.yaml'))
+    logger.info(f"Loaded config: {config}")
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Device: {device}")
+
     os.makedirs('results', exist_ok=True)
 
     N = config['n_nodes_list'][0]
@@ -98,10 +124,14 @@ def train():
     ).to(device)
     model.set_points(points, stencils)
 
-    # CRITICAL FIX: Load and pass interior_mask to projection
+    # CRITICAL FIX: Load and pass interior_mask and interior_node_mask to projection
     G = torch.load('data/fixed_G.pt', map_location=device)
     interior_mask = torch.load('data/interior_mask.pt', map_location=device)
-    model.set_projection(G, interior_mask=interior_mask)
+    # interior_node_mask is the node-level version (N,)
+    # It can be derived from interior_dof_mask by taking every other element
+    interior_node_mask = interior_mask[::2]  # u-DOFs correspond to nodes
+    model.set_projection(G, interior_mask=interior_mask, interior_node_mask=interior_node_mask)
+    logger.info("Projection layer set with interior_mask and interior_node_mask")
 
     lambda_guidance = 0.1
     lambda_milestone = 150
@@ -110,7 +140,7 @@ def train():
     loader = DataLoader(dataset, batch_size=config['batch_size'],
                         shuffle=True, drop_last=True)
 
-    vel_w, prs_w = compute_variance_weights(dataset, device)
+    vel_w, prs_w = compute_variance_weights(dataset, device, logger)
 
     lr = config.get('lr', 1e-3)
     film_params = list(model.film_conditioners.parameters())
@@ -130,13 +160,14 @@ def train():
 
     # CRITICAL FIX: Use exact config keys w_prs and w_div
     w_vel = 1.0
-    w_prs = config['w_prs']   # Must exist in config.yaml
-    w_div = config['w_div']   # Must exist in config.yaml
+    w_prs = config['w_prs']  # Must exist in config.yaml
+    w_div = config['w_div']  # Must exist in config.yaml
 
-    print(f"train_v8 | Hybrid Manifold Guidance (Dual-Path)")
-    print(f"lambda_guidance start={lambda_guidance} → final=0.01 at epoch >= {lambda_milestone}")
-    print(f"Dataset={len(dataset)} | Batch={config['batch_size']} | Epochs={config['epochs']}")
-    print(f"w_vel={w_vel} | w_prs={w_prs} | w_div={w_div}\n")
+    logger.info("Training configuration:")
+    logger.info(f"  Architecture: Hybrid Manifold Guidance (Dual-Path)")
+    logger.info(f"  Lambda: {lambda_guidance} -> 0.01 at epoch >= {lambda_milestone}")
+    logger.info(f"  Dataset: {len(dataset)} | Batch: {config['batch_size']} | Epochs: {config['epochs']}")
+    logger.info(f"  Loss weights: w_vel={w_vel} | w_prs={w_prs} | w_div={w_div}")
 
     best_loss = float('inf')
 
@@ -164,7 +195,7 @@ def train():
             loss_p = variance_weighted_loss(b, b_norm, prs_w)
 
             # NOTE: loss_d is redundant because a_NO is already projected.
-            # G @ a_NO ≈ 4e-5 (float32 floor). Kept for numerical stability.
+            # G @ a_NO ~ 4e-5 (float32 floor). Kept for numerical stability.
             div = torch.einsum('md,bd->bm', G, a_NO)
             loss_d = div.pow(2).mean()
 
@@ -191,15 +222,18 @@ def train():
             torch.save(model.state_dict(), 'results/model_best.pt')
 
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1:4d}/{config['epochs']}] "
-                  f"| Total: {avg:.4e} | Physics: {tot_physics/n:.4e} "
-                  f"| Guidance: {tot_guidance/n:.4e} (λ={current_lambda:.3f}) "
-                  f"| Prs: {tot_p/n:.4e} | Div: {tot_d/n:.4e} "
-                  f"| LR: {optimizer.param_groups[0]['lr']:.2e}")
+            logger.info(
+                f"Epoch [{epoch+1:4d}/{config['epochs']}] | "
+                f"Total: {avg:.4e} | Physics: {tot_physics/n:.4e} | "
+                f"Guidance: {tot_guidance/n:.4e} (lambda={current_lambda:.3f}) | "
+                f"Prs: {tot_p/n:.4e} | Div: {tot_d/n:.4e} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
 
     torch.save(model.state_dict(), 'results/model_final.pt')
-    print(f"\nBest weighted loss: {best_loss:.4e} (با Hybrid Guidance)")
-    print("✅ آموزش با Dual-Path Loss تمام شد")
+    logger.info(f"Best weighted loss: {best_loss:.4e}")
+    logger.info("Training completed successfully")
+    logger.info("=" * 60)
 
 
 if __name__ == '__main__':
