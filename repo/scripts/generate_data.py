@@ -100,7 +100,7 @@ def main():
         re_val = re.item()
 
         try:
-            a_ref, b_ref = solver.solve(
+            a_ref, b_ref, _ = solver.solve(
                 Re=re_val,
                 tau_mom=args.tau_mom,
                 n_max=args.n_max,
