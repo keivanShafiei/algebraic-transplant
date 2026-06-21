@@ -299,6 +299,7 @@ class NavierStokesSolver:
     def solve(
         self,
         Re: float,
+        x0: torch.Tensor | None = None,
         tau_mom: float = 1e-2,
         tau_mass: float = 1e-4,
         n_max: int = 100,
@@ -310,6 +311,9 @@ class NavierStokesSolver:
         ----------
         Re : float
             Reynolds number. Training range: Re in [10, 100].
+        x0 : torch.Tensor | None, optional
+            Initial guess for velocity coefficients, shape (2N,). If None,
+            starts from zero (cold start). Default is None.
         tau_mom : float, optional
             Momentum residual tolerance (default 1e-2).
         tau_mass : float, optional
@@ -326,6 +330,8 @@ class NavierStokesSolver:
             ||G_int a||_2 < tau_mass at exit (by Theorem 1).
         b_full : torch.Tensor
             Pressure coefficient vector, shape (N,). Zero at boundary nodes.
+        n_iter : int
+            Number of fixed-point iterations performed.
 
         Notes
         -----
@@ -358,7 +364,13 @@ class NavierStokesSolver:
             warnings.warn(f"n_max={n_max} is very large. This may be slow.", UserWarning)
 
         nu = 1.0 / Re
-        a = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
+
+        # Initialise from x0 if provided, else zeros (cold start)
+        if x0 is not None:
+            a = x0.clone().to(dtype=torch.float32, device=self.device)
+        else:
+            a = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
+
         b_int = torch.zeros(
             self.is_int.sum(), dtype=torch.float32, device=self.device
         )
@@ -392,4 +404,4 @@ class NavierStokesSolver:
 
         b_full = torch.zeros(self.N, dtype=torch.float32, device=self.device)
         b_full[self.is_int] = b_int
-        return a, b_full
+        return a, b_full, n + 1
