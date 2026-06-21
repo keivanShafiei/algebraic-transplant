@@ -82,10 +82,6 @@ def solve_with_init(solver, x0, Re, tau_mom=TOL_MOM, tau_mass=TOL_MASS, n_max=N_
 def load_surrogate_model(cfg, solver, device="cpu"):
     """
     Load trained NeuralOperator from checkpoint.
-
-    IMPORTANT: We must set up geometry and projection BEFORE loading state_dict
-    because the checkpoint contains projection layer weights.
-    We use strict=False to ignore projection keys since we rebuild from solver.
     """
     model = NeuralOperator(
         n_nodes=N_NODES,
@@ -106,8 +102,6 @@ def load_surrogate_model(cfg, solver, device="cpu"):
     interior_node_mask = solver.is_int.to(device)
     model.set_projection(G, interior_mask=interior_mask, interior_node_mask=interior_node_mask)
 
-    # Now load checkpoint - strict=False because checkpoint has projection.G, projection.chol
-    # which we already rebuilt from the solver
     if CHECKPOINT_PATH.exists():
         state = torch.load(CHECKPOINT_PATH, map_location=device)
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -138,7 +132,11 @@ def predict_surrogate(model, Re, cfg, device="cpu"):
     return a_NO.squeeze(0).cpu().numpy()
 
 def verify_divergence_free(a, solver):
-    a_t = torch.from_numpy(a).float() if isinstance(a, np.ndarray) else a.float()
+    """Verify divergence-free quality. Ensure same device."""
+    if isinstance(a, np.ndarray):
+        a_t = torch.from_numpy(a).float().to(solver.device)
+    else:
+        a_t = a.float().to(solver.device)
     return (solver.G_int @ a_t).norm().item()
 
 def compute_decomposition(iter_cold, iter_zero_df, iter_surrogate):
@@ -180,6 +178,7 @@ def main():
     print("      Iterations:", iter_zero_df, ", Time:", round(t_zero_df, 3), "s")
 
     print("[4/4] Condition C: Surrogate warm-start")
+    print("      Note: Re=500 is outside training range [10,100] (extrapolation)")
     model = load_surrogate_model(cfg, solver=solver, device=device)
 
     if model is None:
