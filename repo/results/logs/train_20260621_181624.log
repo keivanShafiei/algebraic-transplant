@@ -1,0 +1,39 @@
+2026-06-21 18:16:24 | INFO     | rbffd_gnn            | Logging initialized: experiment=train_20260621_181624, level=INFO
+2026-06-21 18:16:24 | INFO     | rbffd_gnn            | ============================================================
+2026-06-21 18:16:24 | INFO     | rbffd_gnn            | RBF-FD GNN Projection — Training Started
+2026-06-21 18:16:24 | INFO     | rbffd_gnn            | ============================================================
+2026-06-21 18:16:24 | INFO     | rbffd_gnn            | Loaded config: {'n_nodes_list': [225], 'stencil_k': 25, 'hidden_dim': 64, 'gnn_layers': 4, 'projection_eps': 1e-08, 'batch_size': 16, 'epochs': 200, 'lr': 0.001, 'weight_decay': '1e-4', 'w_vel': 1.0, 'w_prs': 0.1, 'w_div': 0.01, 'dtype': 'float32', 'operator_assembly_dtype': 'float64', 'device': 'cuda', 'random_seeds': [42, 123, 456, 789, 1024], 'save_freq': 10, 'results_dir': 'results', 'in_channels': 1, 'out_channels': 3, 'num_layers': 4, 'hidden_channels': 64, 'use_film': True, 're_conditioning': True, 'fallback_strategy': 'hybrid'}
+2026-06-21 18:16:25 | INFO     | rbffd_gnn            | Device: cuda
+2026-06-21 18:16:25 | INFO     | rbffd_gnn            | Projection layer set with interior_mask and interior_node_mask
+2026-06-21 18:16:25 | INFO     | rbffd_gnn            | Computing variance weights from dataset...
+2026-06-21 18:16:25 | INFO     | rbffd_gnn            | Velocity weights — min: 0.000, mean: 1.000, max: 6.869
+2026-06-21 18:16:25 | INFO     | rbffd_gnn            | Important nodes (weight > 1.0): 29.8%
+2026-06-21 18:16:25 | INFO     | rbffd_gnn            | Unimportant nodes (weight < 0.1): 25.3%
+2026-06-21 18:16:28 | INFO     | rbffd_gnn            | Training configuration:
+2026-06-21 18:16:28 | INFO     | rbffd_gnn            |   Architecture: Hybrid Manifold Guidance (Dual-Path)
+2026-06-21 18:16:28 | INFO     | rbffd_gnn            |   Lambda: 0.1 -> 0.01 at epoch >= 150
+2026-06-21 18:16:28 | INFO     | rbffd_gnn            |   Dataset: 353 | Batch: 16 | Epochs: 200
+2026-06-21 18:16:28 | INFO     | rbffd_gnn            |   Loss weights: w_vel=1.0 | w_prs=0.1 | w_div=0.01
+2026-06-21 18:16:57 | INFO     | rbffd_gnn            | Epoch [  10/200] | Total: 1.4000e-01 | Physics: 1.1613e-01 | Guidance: 1.1712e-01 (lambda=0.100) | Prs: 1.2164e-01 | Div: 3.3338e-13 | LR: 5.52e-04
+2026-06-21 18:17:24 | INFO     | rbffd_gnn            | Epoch [  20/200] | Total: 1.3950e-01 | Physics: 1.1571e-01 | Guidance: 1.1634e-01 (lambda=0.100) | Prs: 1.2153e-01 | Div: 2.2146e-13 | LR: 1.00e-03
+2026-06-21 18:17:51 | INFO     | rbffd_gnn            | Epoch [  30/200] | Total: 1.3956e-01 | Physics: 1.1580e-01 | Guidance: 1.1622e-01 (lambda=0.100) | Prs: 1.2131e-01 | Div: 1.9481e-13 | LR: 9.92e-04
+2026-06-21 18:18:19 | INFO     | rbffd_gnn            | Epoch [  40/200] | Total: 1.3960e-01 | Physics: 1.1584e-01 | Guidance: 1.1639e-01 (lambda=0.100) | Prs: 1.2126e-01 | Div: 2.1185e-13 | LR: 9.70e-04
+2026-06-21 18:18:46 | INFO     | rbffd_gnn            | Epoch [  50/200] | Total: 1.3930e-01 | Physics: 1.1555e-01 | Guidance: 1.1598e-01 (lambda=0.100) | Prs: 1.2145e-01 | Div: 1.9275e-13 | LR: 9.33e-04
+2026-06-21 18:19:14 | INFO     | rbffd_gnn            | Epoch [  60/200] | Total: 1.3948e-01 | Physics: 1.1571e-01 | Guidance: 1.1626e-01 (lambda=0.100) | Prs: 1.2142e-01 | Div: 1.8766e-13 | LR: 8.83e-04
+2026-06-21 18:19:41 | INFO     | rbffd_gnn            | Epoch [  70/200] | Total: 1.3934e-01 | Physics: 1.1560e-01 | Guidance: 1.1606e-01 (lambda=0.100) | Prs: 1.2138e-01 | Div: 2.4147e-13 | LR: 8.21e-04
+2026-06-21 18:20:09 | INFO     | rbffd_gnn            | Epoch [  80/200] | Total: 1.3929e-01 | Physics: 1.1554e-01 | Guidance: 1.1612e-01 (lambda=0.100) | Prs: 1.2134e-01 | Div: 1.6820e-13 | LR: 7.50e-04
+2026-06-21 18:20:36 | INFO     | rbffd_gnn            | Epoch [  90/200] | Total: 1.3942e-01 | Physics: 1.1566e-01 | Guidance: 1.1619e-01 (lambda=0.100) | Prs: 1.2141e-01 | Div: 1.6702e-13 | LR: 6.71e-04
+2026-06-21 18:21:03 | INFO     | rbffd_gnn            | Epoch [ 100/200] | Total: 1.3936e-01 | Physics: 1.1562e-01 | Guidance: 1.1611e-01 (lambda=0.100) | Prs: 1.2131e-01 | Div: 1.5697e-13 | LR: 5.87e-04
+2026-06-21 18:21:31 | INFO     | rbffd_gnn            | Epoch [ 110/200] | Total: 1.3930e-01 | Physics: 1.1557e-01 | Guidance: 1.1609e-01 (lambda=0.100) | Prs: 1.2126e-01 | Div: 1.9339e-13 | LR: 5.00e-04
+2026-06-21 18:21:59 | INFO     | rbffd_gnn            | Epoch [ 120/200] | Total: 1.3910e-01 | Physics: 1.1538e-01 | Guidance: 1.1592e-01 (lambda=0.100) | Prs: 1.2127e-01 | Div: 2.0493e-13 | LR: 4.13e-04
+2026-06-21 18:22:27 | INFO     | rbffd_gnn            | Epoch [ 130/200] | Total: 1.3900e-01 | Physics: 1.1528e-01 | Guidance: 1.1585e-01 (lambda=0.100) | Prs: 1.2132e-01 | Div: 1.9854e-13 | LR: 3.29e-04
+2026-06-21 18:22:55 | INFO     | rbffd_gnn            | Epoch [ 140/200] | Total: 1.3892e-01 | Physics: 1.1522e-01 | Guidance: 1.1584e-01 (lambda=0.100) | Prs: 1.2113e-01 | Div: 2.1673e-13 | LR: 2.50e-04
+2026-06-21 18:23:22 | INFO     | rbffd_gnn            | Epoch [ 150/200] | Total: 1.2832e-01 | Physics: 1.1507e-01 | Guidance: 1.1564e-01 (lambda=0.010) | Prs: 1.2100e-01 | Div: 2.1179e-13 | LR: 1.79e-04
+2026-06-21 18:23:50 | INFO     | rbffd_gnn            | Epoch [ 160/200] | Total: 1.2837e-01 | Physics: 1.1510e-01 | Guidance: 1.1607e-01 (lambda=0.010) | Prs: 1.2113e-01 | Div: 3.0165e-13 | LR: 1.18e-04
+2026-06-21 18:24:19 | INFO     | rbffd_gnn            | Epoch [ 170/200] | Total: 1.2801e-01 | Physics: 1.1472e-01 | Guidance: 1.1600e-01 (lambda=0.010) | Prs: 1.2123e-01 | Div: 3.6815e-13 | LR: 6.77e-05
+2026-06-21 18:24:47 | INFO     | rbffd_gnn            | Epoch [ 180/200] | Total: 1.2785e-01 | Physics: 1.1455e-01 | Guidance: 1.1596e-01 (lambda=0.010) | Prs: 1.2136e-01 | Div: 3.6831e-13 | LR: 3.10e-05
+2026-06-21 18:25:14 | INFO     | rbffd_gnn            | Epoch [ 190/200] | Total: 1.2757e-01 | Physics: 1.1430e-01 | Guidance: 1.1578e-01 (lambda=0.010) | Prs: 1.2111e-01 | Div: 3.5902e-13 | LR: 8.52e-06
+2026-06-21 18:25:42 | INFO     | rbffd_gnn            | Epoch [ 200/200] | Total: 1.2770e-01 | Physics: 1.1443e-01 | Guidance: 1.1597e-01 (lambda=0.010) | Prs: 1.2103e-01 | Div: 3.6865e-13 | LR: 1.00e-06
+2026-06-21 18:25:42 | INFO     | rbffd_gnn            | Best weighted loss: 1.2757e-01
+2026-06-21 18:25:42 | INFO     | rbffd_gnn            | Training completed successfully
+2026-06-21 18:25:42 | INFO     | rbffd_gnn            | ============================================================
