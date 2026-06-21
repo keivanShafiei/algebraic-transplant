@@ -23,7 +23,7 @@ RE = 500
 N_NODES = 225
 TOL_MOM = 1e-2
 TOL_MASS = 1e-4
-N_MAX = 500
+N_MAX = 2000  # Increased from 500 to allow convergence
 RESULTS_DIR = REPO_ROOT / "results"
 CHECKPOINT_PATH = RESULTS_DIR / "model_best.pt"
 OUTPUT_JSON = RESULTS_DIR / "warmstart_decomposition.json"
@@ -42,47 +42,54 @@ def build_solver(n_nodes=N_NODES, k=25, eps=1e-8, device="cpu"):
     return NavierStokesSolver(points, k=k, eps=eps)
 
 def solve_with_init(solver, x0, Re, tau_mom=TOL_MOM, tau_mass=TOL_MASS, n_max=N_MAX):
-    """Run solver with custom initial guess."""
+    """
+    Run solver with custom initial guess.
+
+    This replicates solver.solve() but starts from x0 instead of zeros.
+    """
     t0 = time.perf_counter()
 
+    nu = 1.0 / Re
+
+    # Initialize from x0 if provided, else zeros
     if x0 is not None:
-        x0_t = torch.from_numpy(x0).float().to(solver.device) if isinstance(x0, np.ndarray) else x0.float().to(solver.device)
-        nu = 1.0 / Re
-        a = x0_t.clone()
-        b_int = torch.zeros(solver.is_int.sum(), dtype=torch.float32, device=solver.device)
-
-        for n in range(n_max):
-            K = assemble_momentum_operator(a, solver.Gx, solver.Gy, solver.Phi, solver.Lap, nu, solver.is_int)
-            try:
-                a_star = torch.linalg.solve(K, solver.F)
-            except torch.linalg.LinAlgError:
-                reg = 1e-6 * torch.eye(2 * solver.N, dtype=torch.float32, device=solver.device)
-                a_star = torch.linalg.solve(K + reg, solver.F)
-
-            a_new, b_new_int = solver._project(a_star)
-            mom_res = solver._momentum_residual(a_new, b_new_int, nu)
-            div_res = (solver.G_int @ a_new).norm().item()
-
-            a = 0.7 * a_new + 0.3 * a
-            b_int = b_new_int
-
-            if mom_res < tau_mom and div_res < tau_mass:
-                a = a_new
-                break
-
-        b_full = torch.zeros(solver.N, dtype=torch.float32, device=solver.device)
-        b_full[solver.is_int] = b_int
-        elapsed = time.perf_counter() - t0
-        return a, b_full, n + 1, elapsed
+        if isinstance(x0, np.ndarray):
+            a = torch.from_numpy(x0).float().to(solver.device)
+        else:
+            a = x0.float().to(solver.device)
     else:
-        a, b = solver.solve(Re=Re, tau_mom=tau_mom, tau_mass=tau_mass, n_max=n_max)
-        elapsed = time.perf_counter() - t0
-        return a, b, n_max, elapsed
+        a = torch.zeros(2 * solver.N, dtype=torch.float32, device=solver.device)
+
+    b_int = torch.zeros(solver.is_int.sum(), dtype=torch.float32, device=solver.device)
+
+    for n in range(n_max):
+        K = assemble_momentum_operator(a, solver.Gx, solver.Gy, solver.Phi, solver.Lap, nu, solver.is_int)
+        try:
+            a_star = torch.linalg.solve(K, solver.F)
+        except torch.linalg.LinAlgError:
+            reg = 1e-6 * torch.eye(2 * solver.N, dtype=torch.float32, device=solver.device)
+            a_star = torch.linalg.solve(K + reg, solver.F)
+
+        a_new, b_new_int = solver._project(a_star)
+        mom_res = solver._momentum_residual(a_new, b_new_int, nu)
+        div_res = (solver.G_int @ a_new).norm().item()
+
+        # Relaxed update
+        a = 0.7 * a_new + 0.3 * a
+        b_int = b_new_int
+
+        if mom_res < tau_mom and div_res < tau_mass:
+            a = a_new
+            break
+
+    b_full = torch.zeros(solver.N, dtype=torch.float32, device=solver.device)
+    b_full[solver.is_int] = b_int
+
+    elapsed = time.perf_counter() - t0
+    return a, b_full, n + 1, elapsed
 
 def load_surrogate_model(cfg, solver, device="cpu"):
-    """
-    Load trained NeuralOperator from checkpoint.
-    """
+    """Load trained NeuralOperator from checkpoint."""
     model = NeuralOperator(
         n_nodes=N_NODES,
         hidden=cfg.get("hidden_dim", 64),
@@ -91,12 +98,10 @@ def load_surrogate_model(cfg, solver, device="cpu"):
         eps=float(cfg.get("projection_eps", 1e-8)),
     ).to(device)
 
-    # Setup geometry first
     points = solver.points
     stencils = build_stencils(points, cfg.get("stencil_k", 25)).to(device)
     model.set_points(points, stencils)
 
-    # Setup projection BEFORE loading state_dict
     G = solver.G_int.to(device)
     interior_mask = solver.interior_dof_mask.to(device)
     interior_node_mask = solver.is_int.to(device)
@@ -118,7 +123,6 @@ def predict_surrogate(model, Re, cfg, device="cpu"):
     re_max = cfg.get("re_max", 100.0)
     mu = torch.tensor([Re / re_max], dtype=torch.float32, device=device)
 
-    # Build edge_index from model's stored points and stencils
     points = model.points
     N = points.shape[0]
     k = cfg.get("stencil_k", 25)
@@ -132,7 +136,7 @@ def predict_surrogate(model, Re, cfg, device="cpu"):
     return a_NO.squeeze(0).cpu().numpy()
 
 def verify_divergence_free(a, solver):
-    """Verify divergence-free quality. Ensure same device."""
+    """Verify divergence-free quality."""
     if isinstance(a, np.ndarray):
         a_t = torch.from_numpy(a).float().to(solver.device)
     else:
@@ -170,7 +174,7 @@ def main():
     print("      Interior nodes:", solver.is_int.sum().item(), "/", solver.N)
 
     print("[2/4] Condition A: Cold start")
-    _, _, iter_cold, t_cold = solve_with_init(solver, np.zeros(2*N_NODES), Re=RE)
+    _, _, iter_cold, t_cold = solve_with_init(solver, None, Re=RE)
     print("      Iterations:", iter_cold, ", Time:", round(t_cold, 3), "s")
 
     print("[3/4] Condition B: Div-free zero field")
