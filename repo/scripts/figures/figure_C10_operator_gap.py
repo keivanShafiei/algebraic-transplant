@@ -1,12 +1,12 @@
 """Figure C10: Operator gap δ_op vs mesh spacing h (log-log).
 
-Shows ||D - G^T||_2 / ||G^T||_2 vs h = N^{-1/2}.
-Fitted slope ≈ 2.0 confirms O(h²) scaling.
-Includes ε_ML = 13.75% horizontal line.
+Data source: RBF-FD solver operator assembly or saved operator_gap.json
 """
 
 import sys
 import os
+import re
+import json
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,16 +19,54 @@ from scripts.figures.utils import (
     setup_figure, save_figure, format_scientific, add_panel_label, COLORS
 )
 
-def main():
-    np.random.seed(49)
+def load_operator_gap_data():
+    """Load operator gap data from RBF-FD assembly."""
+
+    data_paths = [
+        'results/logs/operator_gap.json',
+        'results/operator_gap.json',
+    ]
+    for p in data_paths:
+        if os.path.exists(p):
+            with open(p) as f:
+                d = json.load(f)
+            N_vals = np.array(d['N'])
+            delta_op = np.array(d['delta_op'])
+            return N_vals, delta_op
+
+    # Try to compute from available operators
+    op_dir = Path('data/operators')
+    if op_dir.exists():
+        N_vals, delta_ops = [], []
+        for op_file in sorted(op_dir.glob('G_*.pt')):
+            try:
+                import torch
+                G = torch.load(op_file, map_location='cpu')
+                # Try to find corresponding D operator
+                D_file = op_file.parent / op_file.name.replace('G_', 'D_')
+                if D_file.exists():
+                    D = torch.load(D_file, map_location='cpu')
+                    gap = torch.norm(D - G.T).item() / (torch.norm(G.T).item() + 1e-12)
+                    N = int(re.search(r'(\d+)', op_file.stem).group(1))
+                    N_vals.append(N)
+                    delta_ops.append(gap)
+            except Exception:
+                continue
+        if N_vals:
+            idx = np.argsort(N_vals)
+            return np.array(N_vals)[idx], np.array(delta_ops)[idx]
+
+    # Fallback
+    print("WARNING: Using synthetic fallback. Compute operators for real data.")
     N_vals = np.array([225, 961, 4096, 10000])
+    delta_op = 1.8 * (1.0 / np.sqrt(N_vals)) ** 2.0
+    return N_vals, delta_op
+
+def main():
+    N_vals, delta_op = load_operator_gap_data()
     h_vals = 1.0 / np.sqrt(N_vals)
 
-    # δ_op = O(h²), with some noise
-    delta_op = 1.8 * h_vals ** 2.0 + np.random.randn(4) * 0.0003
-    delta_op = np.clip(delta_op, 0.001, 0.01)
-
-    # Fit line
+    # Fit
     log_h = np.log10(h_vals)
     log_d = np.log10(delta_op)
     slope, intercept = np.polyfit(log_h, log_d, 1)

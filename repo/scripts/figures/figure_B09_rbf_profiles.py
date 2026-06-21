@@ -1,7 +1,6 @@
 """Figure B9: RBF kernel profiles with twin y-axes.
 
-Left axis: φ(r) and dφ/dr
-Right axis: ∇²φ(r) (much larger scale)
+Uses analytical MQ RBF formulas. No external data needed.
 """
 
 import sys
@@ -28,9 +27,21 @@ def mq_laplacian(r, c, d=2):
     return d / (c**2 * (1 + (r / c) ** 2) ** 1.5)
 
 def main():
-    c = 1.2 * (1.0 / np.sqrt(225))
-    r = np.linspace(0, 3 * c, 200)
+    # Load c from config if available
+    c = 1.2 * (1.0 / np.sqrt(225))  # default
+    config_path = 'config.yaml'
+    if os.path.exists(config_path):
+        try:
+            import yaml
+            config = yaml.safe_load(open(config_path))
+            if 'rbf_c_factor' in config and 'n_nodes_list' in config:
+                N = config['n_nodes_list'][0]
+                h = 1.0 / np.sqrt(N)
+                c = config['rbf_c_factor'] * h
+        except Exception:
+            pass
 
+    r = np.linspace(0, 3 * c, 200)
     phi = mq_phi(r, c)
     dphi = mq_dphi(r, c)
     lap = mq_laplacian(r, c, d=2)
@@ -38,7 +49,6 @@ def main():
     fig, axes = setup_figure(width=3.5, height=2.5, nrows=1, ncols=1)
     ax = axes[0, 0]
 
-    # Left axis: φ and dφ/dr
     ax.plot(r, phi, '-', color=COLORS['blue'], linewidth=1.5, label=r'$\phi(r)$')
     ax.plot(r, dphi, '--', color=COLORS['orange'], linewidth=1.5, label=r"$\phi'(r)$")
     ax.set_xlabel(r'$r$')
@@ -46,7 +56,6 @@ def main():
     ax.tick_params(axis='y', labelcolor=COLORS['blue'])
     ax.set_ylim(0, 1.5)
 
-    # Right axis: ∇²φ (much larger)
     ax2 = ax.twinx()
     ax2.plot(r, lap, '-.', color=COLORS['green'], linewidth=1.5, label=r"$\nabla^2 \phi(r)$")
     ax2.set_ylabel(r"$\nabla^2 \phi(r)$", color=COLORS['green'])
@@ -56,7 +65,6 @@ def main():
     ax.axvline(x=c, color='gray', linestyle=':', alpha=0.7)
     ax.text(c, 1.35, f'$c={c:.4f}$', fontsize=8, color='gray', ha='center')
 
-    # Combined legend
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
