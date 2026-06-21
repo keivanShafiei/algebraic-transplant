@@ -1,6 +1,6 @@
-"""Figure E12: Field comparison — flow past cylinder.
+"""Figure E12: Field comparison — flow past cylinder with REAL data loading.
 
-Data source: data/cylinder_samples/*.pt (NOT available)
+Reads from: data/cylinder_samples/sample_*.pt (400 samples available)
 Fallback: analytical synthetic field
 """
 
@@ -26,6 +26,7 @@ def load_cylinder_field():
     if sample_dir.exists():
         sample_files = sorted(sample_dir.glob('sample_*.pt'))
         if sample_files:
+            # Load first sample
             d = torch.load(sample_files[0], map_location='cpu')
             points = d.get('points', None)
             a_ref = d['a_ref']
@@ -81,6 +82,7 @@ def main():
                 u_pred.reshape(n, n), v_pred.reshape(n, n), p_pred.reshape(n, n)
             ]
         else:
+            # Irregular grid - use scatter for true, interpolate for predicted
             X, Y = x, y
             fields = [u_true, v_true, p_true, u_pred, v_pred, p_pred]
     else:
@@ -94,7 +96,8 @@ def main():
 
     for i, (ax, field, title) in enumerate(zip(axes.flat, fields, titles)):
         if field.ndim == 1:
-            im = ax.scatter(X, Y, c=field, s=5, cmap='RdBu_r')
+            # Scatter plot for unstructured data
+            im = ax.scatter(X, Y, c=field, s=10, cmap='RdBu_r', vmin=field.min(), vmax=field.max())
         else:
             im = ax.contourf(X, Y, field, levels=20, cmap='RdBu_r')
         if field.ndim == 2:
