@@ -1,6 +1,7 @@
 """Figure B9: RBF kernel profiles with twin y-axes.
 
-Uses analytical MQ RBF formulas. No external data needed.
+Reads c from: config.yaml (if available)
+Fallback: c = 1.2 * h_avg for N=225
 """
 
 import sys
@@ -26,21 +27,29 @@ def mq_dphi(r, c):
 def mq_laplacian(r, c, d=2):
     return d / (c**2 * (1 + (r / c) ** 2) ** 1.5)
 
-def main():
-    # Load c from config if available
-    c = 1.2 * (1.0 / np.sqrt(225))  # default
-    config_path = 'config.yaml'
-    if os.path.exists(config_path):
+def load_c_parameter():
+    """Load c from config.yaml if available."""
+    config_path = Path('config.yaml')
+    if config_path.exists():
         try:
             import yaml
-            config = yaml.safe_load(open(config_path))
+            with open(config_path) as f:
+                config = yaml.safe_load(f)
             if 'rbf_c_factor' in config and 'n_nodes_list' in config:
                 N = config['n_nodes_list'][0]
                 h = 1.0 / np.sqrt(N)
                 c = config['rbf_c_factor'] * h
+                print(f"[Figure B9] Loaded c={c:.4f} from config.yaml")
+                return c
         except Exception:
             pass
 
+    c = 1.2 * (1.0 / np.sqrt(225))
+    print(f"[Figure B9] Using default c={c:.4f}")
+    return c
+
+def main():
+    c = load_c_parameter()
     r = np.linspace(0, 3 * c, 200)
     phi = mq_phi(r, c)
     dphi = mq_dphi(r, c)

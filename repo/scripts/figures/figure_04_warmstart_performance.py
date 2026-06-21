@@ -1,16 +1,11 @@
-"""Figure 4: Warm-start performance — 4-panel with real data loading.
+"""Figure 4: Warm-start performance — 4-panel with REAL data loading.
 
-(a) Solver iterations vs Re
-(b) Wall-clock speedup vs Re  
-(c) Corrected solution accuracy vs Re
-(d) Standalone surrogate error vs Re
-
-Data source: scripts/eval_warmstart.py or saved warmstart_results.json
+Reads from: results/warmstart_decomposition.json
+Fallback: synthetic data matching paper Section 5.1
 """
 
 import sys
 import os
-import re
 import json
 from pathlib import Path
 import numpy as np
@@ -25,49 +20,26 @@ from scripts.figures.utils import (
 )
 
 def load_warmstart_data():
-    """Load warm-start performance data."""
+    """Load warm-start performance data from warmstart_decomposition.json."""
 
-    data_paths = [
-        'results/logs/warmstart_results.json',
-        'results/warmstart_results.json',
-    ]
-    for p in data_paths:
-        if os.path.exists(p):
-            with open(p) as f:
-                d = json.load(f)
-            re_vals = np.array(d['Re'])
-            iter_cold = np.array(d.get('iter_cold', [500]*len(re_vals)))
-            iter_warm = np.array(d['iter_warm'])
-            speedup = np.array(d.get('speedup', iter_cold / iter_warm))
-            corr_acc = np.array(d.get('corr_acc', []))
-            standalone_err = np.array(d.get('standalone_err', []))
-            return re_vals, iter_cold, iter_warm, speedup, corr_acc, standalone_err
+    json_path = Path('results/warmstart_decomposition.json')
+    if json_path.exists():
+        with open(json_path) as f:
+            d = json.load(f)
 
-    # Try to parse any warmstart logs
-    log_dir = Path('results/logs')
-    if log_dir.exists():
-        log_files = sorted(log_dir.glob('*warmstart*.log'))
-        if log_files:
-            re_vals, iters, times = [], [], []
-            for lf in log_files:
-                with open(lf) as f:
-                    text = f.read()
-                re_m = re.search(r'Re\s*=\s*(\d+)', text)
-                iter_m = re.search(r'iterations?\s*[:=]\s*(\d+)', text, re.I)
-                if re_m and iter_m:
-                    re_vals.append(int(re_m.group(1)))
-                    iters.append(int(iter_m.group(1)))
-            if re_vals:
-                re_vals = np.array(sorted(set(re_vals)))
-                iter_cold = np.full(len(re_vals), 500)
-                iter_warm = np.array([np.mean([it for r, it in zip(re_vals, iters) if r == rv]) for rv in re_vals])
-                speedup = iter_cold / iter_warm
-                corr_acc = np.random.uniform(0.3, 0.9, len(re_vals))
-                standalone_err = np.array([15, 28, 38, 45, 49][:len(re_vals)])
-                return re_vals, iter_cold, iter_warm, speedup, corr_acc, standalone_err
+        # Extract Re, iterations, speedup from JSON
+        re_vals = np.array(d.get('Re', [100, 200, 300, 400, 500]))
+        iter_cold = np.array(d.get('iter_cold', [500]*len(re_vals)))
+        iter_warm = np.array(d.get('iter_warm', []))
+        speedup = np.array(d.get('speedup', []))
+        corr_acc = np.array(d.get('corr_acc', []))
+        standalone_err = np.array(d.get('standalone_err', []))
+
+        print(f"[Figure 4] Loaded real warm-start data from warmstart_decomposition.json")
+        return re_vals, iter_cold, iter_warm, speedup, corr_acc, standalone_err
 
     # Fallback
-    print("WARNING: Using synthetic fallback. Run warm-start evaluation for real data.")
+    print("[Figure 4] WARNING: warmstart_decomposition.json not found. Using synthetic fallback.")
     re_vals = np.array([100, 200, 300, 400, 500])
     iter_cold = np.full(5, 500)
     iter_warm = 500 - 380 * (re_vals / 500) ** 0.7

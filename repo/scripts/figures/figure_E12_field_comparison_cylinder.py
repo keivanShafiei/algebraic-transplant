@@ -1,6 +1,7 @@
-"""Figure E12: Field comparison — flow past cylinder with real data loading.
+"""Figure E12: Field comparison — flow past cylinder.
 
-Data source: data/cylinder_samples/sample_*.pt
+Data source: data/cylinder_samples/*.pt (NOT available)
+Fallback: analytical synthetic field
 """
 
 import sys
@@ -18,28 +19,33 @@ from scripts.figures.utils import (
     setup_figure, save_figure, format_scientific, add_panel_label, COLORS
 )
 
-def load_cylinder_field(sample_path='data/cylinder_samples/sample_0000.pt'):
-    """Load cylinder field from sample file."""
-    if os.path.exists(sample_path):
-        d = torch.load(sample_path, map_location='cpu')
-        points = d.get('points', None)
-        a_ref = d['a_ref']
-        b_ref = d.get('b_ref', None)
+def load_cylinder_field():
+    """Load cylinder field from sample files."""
 
-        if points is not None:
-            N = points.shape[0]
-            x = points[:, 0].numpy()
-            y = points[:, 1].numpy()
-            u = a_ref[0::2].numpy()
-            v = a_ref[1::2].numpy()
-            if b_ref is not None:
-                p = b_ref.numpy()
-            else:
-                p = np.zeros(N)
-            return x, y, u, v, p
+    sample_dir = Path('data/cylinder_samples')
+    if sample_dir.exists():
+        sample_files = sorted(sample_dir.glob('sample_*.pt'))
+        if sample_files:
+            d = torch.load(sample_files[0], map_location='cpu')
+            points = d.get('points', None)
+            a_ref = d['a_ref']
+            b_ref = d.get('b_ref', None)
 
-    # Fallback: analytical
-    print("WARNING: Using synthetic fallback. Load real cylinder sample for actual data.")
+            if points is not None:
+                N = points.shape[0]
+                x = points[:, 0].numpy()
+                y = points[:, 1].numpy()
+                u = a_ref[0::2].numpy()
+                v = a_ref[1::2].numpy()
+                if b_ref is not None:
+                    p = b_ref.numpy()
+                else:
+                    p = np.zeros(N)
+                print(f"[Figure E12] Loaded real cylinder field from {sample_files[0].name} ({N} nodes)")
+                return x, y, u, v, p
+
+    # Fallback
+    print("[Figure E12] WARNING: No cylinder sample files found. Using synthetic fallback.")
     n = 40
     x = np.linspace(-2, 4, n)
     y = np.linspace(-2, 2, n)
@@ -64,7 +70,6 @@ def main():
     p_pred = p_true + np.random.randn(*p_true.shape) * noise * 0.5
 
     if x.ndim == 1:
-        # Try to reconstruct grid
         ux = np.unique(x)
         uy = np.unique(y)
         if len(ux) * len(uy) == len(x):
@@ -76,7 +81,6 @@ def main():
                 u_pred.reshape(n, n), v_pred.reshape(n, n), p_pred.reshape(n, n)
             ]
         else:
-            # Scatter plot fallback
             X, Y = x, y
             fields = [u_true, v_true, p_true, u_pred, v_pred, p_pred]
     else:

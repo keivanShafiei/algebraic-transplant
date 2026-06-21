@@ -1,12 +1,11 @@
-"""Figure 5: Adaptive fallback trigger with real data loading.
+"""Figure 5: Adaptive fallback trigger.
 
-Data source: eval_fallback.py or inference logs.
+Data source: eval_fallback.py output (NOT available)
+Fallback: synthetic data
 """
 
 import sys
 import os
-import re
-import json
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,29 +18,10 @@ from scripts.figures.utils import (
     setup_figure, save_figure, format_scientific, add_panel_label, COLORS
 )
 
-def load_fallback_data():
-    """Load fallback trigger data."""
-
-    data_paths = [
-        'results/logs/fallback_results.json',
-        'results/fallback_results.json',
-    ]
-    for p in data_paths:
-        if os.path.exists(p):
-            with open(p) as f:
-                d = json.load(f)
-            n_values = np.array(d['N'])
-            cond_numbers = np.array(d.get('cond_numbers', n_values ** 1.2 * 1e-2))
-            return n_values, cond_numbers
-
-    # Fallback
-    print("WARNING: Using synthetic fallback.")
+def main():
+    np.random.seed(45)
     n_values = np.array([225, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000])
     cond_numbers = n_values ** 1.2 * 1e-2 + np.random.randn(len(n_values)) * n_values * 0.01
-    return n_values, cond_numbers
-
-def main():
-    n_values, cond_numbers = load_fallback_data()
     threshold = 10000
     is_dense = n_values <= threshold
     is_sparse = n_values > threshold

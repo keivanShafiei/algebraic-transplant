@@ -1,12 +1,12 @@
 """Figure C10: Operator gap δ_op vs mesh spacing h (log-log).
 
-Data source: RBF-FD solver operator assembly or saved operator_gap.json
+Reads from: results/operator_gap_table.csv
+Fallback: synthetic data with slope ≈ 2.0
 """
 
 import sys
 import os
-import re
-import json
+import csv
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,53 +20,32 @@ from scripts.figures.utils import (
 )
 
 def load_operator_gap_data():
-    """Load operator gap data from RBF-FD assembly."""
+    """Load operator gap data from operator_gap_table.csv."""
 
-    data_paths = [
-        'results/logs/operator_gap.json',
-        'results/operator_gap.json',
-    ]
-    for p in data_paths:
-        if os.path.exists(p):
-            with open(p) as f:
-                d = json.load(f)
-            N_vals = np.array(d['N'])
-            delta_op = np.array(d['delta_op'])
-            return N_vals, delta_op
-
-    # Try to compute from available operators
-    op_dir = Path('data/operators')
-    if op_dir.exists():
+    csv_path = Path('results/operator_gap_table.csv')
+    if csv_path.exists():
         N_vals, delta_ops = [], []
-        for op_file in sorted(op_dir.glob('G_*.pt')):
-            try:
-                import torch
-                G = torch.load(op_file, map_location='cpu')
-                # Try to find corresponding D operator
-                D_file = op_file.parent / op_file.name.replace('G_', 'D_')
-                if D_file.exists():
-                    D = torch.load(D_file, map_location='cpu')
-                    gap = torch.norm(D - G.T).item() / (torch.norm(G.T).item() + 1e-12)
-                    N = int(re.search(r'(\d+)', op_file.stem).group(1))
-                    N_vals.append(N)
-                    delta_ops.append(gap)
-            except Exception:
-                continue
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                N_vals.append(float(row.get('N', row.get('n', 0))))
+                delta_ops.append(float(row.get('delta_op', row.get('gap', 0))))
         if N_vals:
-            idx = np.argsort(N_vals)
-            return np.array(N_vals)[idx], np.array(delta_ops)[idx]
+            N_vals = np.array(N_vals)
+            delta_ops = np.array(delta_ops)
+            print(f"[Figure C10] Loaded real operator gap data from operator_gap_table.csv ({len(N_vals)} points)")
+            return N_vals, delta_ops
 
     # Fallback
-    print("WARNING: Using synthetic fallback. Compute operators for real data.")
+    print("[Figure C10] WARNING: operator_gap_table.csv not found. Using synthetic fallback.")
     N_vals = np.array([225, 961, 4096, 10000])
-    delta_op = 1.8 * (1.0 / np.sqrt(N_vals)) ** 2.0
-    return N_vals, delta_op
+    delta_ops = 1.8 * (1.0 / np.sqrt(N_vals)) ** 2.0
+    return N_vals, delta_ops
 
 def main():
     N_vals, delta_op = load_operator_gap_data()
     h_vals = 1.0 / np.sqrt(N_vals)
 
-    # Fit
     log_h = np.log10(h_vals)
     log_d = np.log10(delta_op)
     slope, intercept = np.polyfit(log_h, log_d, 1)

@@ -1,15 +1,11 @@
 """Figure 3: Resolution behavior with real data loading.
 
-Shows RBF-FD solver error, neural operator, and O(h²) reference.
-Includes ×329 annotation at N=10,000.
-
-Data source: eval_zeroshot.py output or saved results
+Data source: eval_zeroshot.py output (NOT available in current environment)
+Fallback: synthetic data matching paper Section 4.1
 """
 
 import sys
 import os
-import re
-import json
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,61 +19,37 @@ from scripts.figures.utils import (
 )
 
 def load_resolution_data():
-    """Load resolution transfer data from eval_zeroshot output."""
+    """Load resolution transfer data."""
 
-    # Try saved results
+    # Check for zero-shot results
     data_paths = [
         'results/logs/zeroshot_results.json',
         'results/zeroshot_results.json',
     ]
     for p in data_paths:
         if os.path.exists(p):
+            import json
             with open(p) as f:
                 d = json.load(f)
             N_vals = np.array(d['N'])
             solver_err = np.array(d.get('solver_err', []))
             no_err = np.array(d.get('no_err', []))
-            no_err_scaled = np.array(d.get('no_err_scaled', []))
-            return N_vals, solver_err, no_err, no_err_scaled
-
-    # Try to parse eval_zeroshot output
-    log_dir = Path('results/logs')
-    if log_dir.exists():
-        log_files = sorted(log_dir.glob('eval_zeroshot_*.log'))
-        if log_files:
-            N_vals, no_errs = [], []
-            pattern = re.compile(r'velocity L2 \(scaled\)\s*=\s*([\d.e+-]+)')
-            for lf in log_files:
-                with open(lf) as f:
-                    text = f.read()
-                m = pattern.search(text)
-                if m:
-                    no_errs.append(float(m.group(1)))
-                    nm = re.search(r'(\d+)', lf.name)
-                    if nm:
-                        N_vals.append(int(nm.group(1)))
-            if N_vals:
-                N_vals = np.array(sorted(set(N_vals)))
-                solver_err = 0.15 * (225.0 / N_vals) ** 0.55
-                no_err = np.full(len(N_vals), np.mean(no_errs))
-                return N_vals, solver_err, no_err, no_err
+            print(f"[Figure 3] Loaded real zero-shot data from {p}")
+            return N_vals, solver_err, no_err
 
     # Fallback: synthetic matching paper
-    print("WARNING: Using synthetic fallback. Run eval_zeroshot.py for real data.")
+    print("[Figure 3] WARNING: No zero-shot data found. Using synthetic fallback.")
     N_vals = np.array([225, 1000, 5000, 10000])
     h_vals = 1.0 / np.sqrt(N_vals)
     h0 = h_vals[0]
     solver_err = 0.15 * (h_vals / h0) ** 1.1
     no_err = np.full(4, 0.102)
-    no_err_scaled = no_err.copy()
-    return N_vals, solver_err, no_err, no_err_scaled
+    return N_vals, solver_err, no_err
 
 def main():
-    N_vals, solver_err, no_err, no_err_scaled = load_resolution_data()
+    N_vals, solver_err, no_err = load_resolution_data()
     h_vals = 1.0 / np.sqrt(N_vals)
-    h0 = h_vals[0] if len(h_vals) > 0 else 1.0
-
-    # O(h²) reference — must match N_vals length for plotting
+    h0 = h_vals[0]
     oh2_ref = 0.15 * (h_vals / h0) ** 2.0
 
     fig, axes = setup_figure(width=3.5, height=2.5, nrows=1, ncols=1)
@@ -85,23 +57,19 @@ def main():
 
     ax.plot(N_vals, solver_err, 'o-', color=COLORS['blue'], linewidth=1.5, markersize=6, label='RBF-FD solver')
     ax.plot(N_vals, no_err, 's--', color=COLORS['orange'], linewidth=1.5, markersize=6, label='Neural operator')
-    if len(no_err_scaled) == len(no_err):
-        ax.plot(N_vals, no_err_scaled, '^-.', color=COLORS['green'], linewidth=1.5, markersize=6, label='Scale-adaptive')
     ax.plot(N_vals, oh2_ref, ':', color=COLORS['gray'], linewidth=1.0, label=r'$\mathcal{O}(h^2)$ reference')
 
-    # ×329 annotation
-    if len(solver_err) > 0 and len(no_err) > 0:
-        ratio = solver_err[-1] / no_err[-1]
-        ax.annotate(f'$\times{ratio:.0f}$', xy=(N_vals[-1], no_err[-1]),
-                    xytext=(N_vals[-1]*0.5, no_err[-1]*2),
-                    fontsize=9, color='red',
-                    arrowprops=dict(arrowstyle='->', color='red', lw=1.0))
+    ratio = solver_err[-1] / no_err[-1]
+    ax.annotate(f'$\times{ratio:.0f}$', xy=(N_vals[-1], no_err[-1]),
+                xytext=(N_vals[-1]*0.5, no_err[-1]*2),
+                fontsize=9, color='red',
+                arrowprops=dict(arrowstyle='->', color='red', lw=1.0))
 
     ax.set_xlabel('Number of nodes $N$')
     ax.set_ylabel(r'Relative $L_2$ error')
     ax.set_xscale('log')
     ax.set_yscale('log')
-    ax.set_xlim(N_vals.min() * 0.7, N_vals.max() * 1.4)
+    ax.set_xlim(150, 15000)
     ax.set_ylim(1e-4, 0.3)
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3, which='both')

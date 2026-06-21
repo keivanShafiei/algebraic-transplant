@@ -1,11 +1,11 @@
-"""Figure 8: Drag force sensitivity with real data loading.
+"""Figure 8: Drag force sensitivity with REAL data loading.
 
-Data source: eval_force_sensitivity.py or saved drag_sensitivity.json
+Reads from: results/force_sensitivity.json
+Fallback: synthetic data matching Table drag_sensitivity
 """
 
 import sys
 import os
-import re
 import json
 from pathlib import Path
 import numpy as np
@@ -20,38 +20,23 @@ from scripts.figures.utils import (
 )
 
 def load_drag_sensitivity_data():
-    """Load drag sensitivity data."""
+    """Load drag sensitivity data from force_sensitivity.json."""
 
-    data_paths = [
-        'results/logs/drag_sensitivity.json',
-        'results/drag_sensitivity.json',
-    ]
-    for p in data_paths:
-        if os.path.exists(p):
-            with open(p) as f:
-                d = json.load(f)
-            l2_vel = np.array(d['l2_velocity_pct'])
-            drag_mean = np.array(d['drag_mean_pct'])
-            drag_std = np.array(d['drag_std_pct'])
+    json_path = Path('results/force_sensitivity.json')
+    if json_path.exists():
+        with open(json_path) as f:
+            d = json.load(f)
+
+        l2_vel = np.array(d.get('l2_velocity_pct', []))
+        drag_mean = np.array(d.get('drag_mean_pct', []))
+        drag_std = np.array(d.get('drag_std_pct', []))
+
+        if len(l2_vel) > 0:
+            print(f"[Figure 8] Loaded real drag sensitivity data from force_sensitivity.json ({len(l2_vel)} points)")
             return l2_vel, drag_mean, drag_std
 
-    # Try to parse any drag sensitivity logs
-    log_dir = Path('results/logs')
-    if log_dir.exists():
-        log_files = sorted(log_dir.glob('*drag*.log'))
-        for lf in log_files:
-            with open(lf) as f:
-                text = f.read()
-            # Look for table-like data
-            vals = re.findall(r'(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)', text)
-            if len(vals) >= 3:
-                l2_vel = np.array([float(v[0]) for v in vals])
-                drag_mean = np.array([float(v[1]) for v in vals])
-                drag_std = np.array([float(v[2]) for v in vals])
-                return l2_vel, drag_mean, drag_std
-
-    # Fallback: synthetic from Table drag_sensitivity
-    print("WARNING: Using synthetic fallback. Run force sensitivity evaluation for real data.")
+    # Fallback
+    print("[Figure 8] WARNING: force_sensitivity.json not found. Using synthetic fallback.")
     l2_vel = np.array([1.0, 3.0, 5.0, 8.0, 10.0, 13.75])
     drag_mean = np.array([1.48, 4.44, 7.39, 11.83, 14.79, 20.33])
     drag_std = np.array([1.16, 3.47, 5.78, 9.24, 11.55, 15.88])
@@ -60,7 +45,6 @@ def load_drag_sensitivity_data():
 def main():
     l2_vel, drag_mean, drag_std = load_drag_sensitivity_data()
 
-    # Linear fit
     A = 1.47
     drag_fit = A * l2_vel
 
