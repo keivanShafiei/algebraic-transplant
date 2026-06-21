@@ -53,14 +53,12 @@ def load_resolution_data():
                 m = pattern.search(text)
                 if m:
                     no_errs.append(float(m.group(1)))
-                    # Extract N from filename or content
                     nm = re.search(r'(\d+)', lf.name)
                     if nm:
                         N_vals.append(int(nm.group(1)))
             if N_vals:
                 N_vals = np.array(sorted(set(N_vals)))
-                # Solver error from RBF-FD theory
-                solver_err = 0.15 * (225.0 / N_vals) ** 0.55  # empirical sub-quadratic
+                solver_err = 0.15 * (225.0 / N_vals) ** 0.55
                 no_err = np.full(len(N_vals), np.mean(no_errs))
                 return N_vals, solver_err, no_err, no_err
 
@@ -79,9 +77,8 @@ def main():
     h_vals = 1.0 / np.sqrt(N_vals)
     h0 = h_vals[0] if len(h_vals) > 0 else 1.0
 
-    # O(h²) reference
-    h_ref = np.linspace(h_vals.min() * 0.8, h_vals.max() * 1.2, 100)
-    oh2_ref = 0.15 * (h_ref / h0) ** 2.0
+    # O(h²) reference — must match N_vals length for plotting
+    oh2_ref = 0.15 * (h_vals / h0) ** 2.0
 
     fig, axes = setup_figure(width=3.5, height=2.5, nrows=1, ncols=1)
     ax = axes[0, 0]

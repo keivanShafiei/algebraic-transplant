@@ -53,8 +53,8 @@ def main():
     ax.scatter(n_values[is_sparse], cond_numbers[is_sparse], c=COLORS['red'], s=80, marker='s', label='Sparse PCG', edgecolors='k', linewidth=0.5, zorder=3)
 
     ax.axvline(x=threshold, color='gray', linestyle='--', alpha=0.7, linewidth=1.0)
-    ax.text(threshold + 2000, cond_numbers.max() * 0.9, f'Fallback threshold
-$N = {threshold}$', fontsize=8, color='gray', ha='left')
+    label_text = f'Fallback threshold\n$N = {threshold}$'
+    ax.text(threshold + 2000, cond_numbers.max() * 0.9, label_text, fontsize=8, color='gray', ha='left')
 
     ax.set_xlabel('Number of nodes $N$')
     ax.set_ylabel(r'Condition number $\kappa(\mathbf{G}\mathbf{G}^T)$')
