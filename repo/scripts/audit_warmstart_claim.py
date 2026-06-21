@@ -79,35 +79,59 @@ def solve_with_init(solver, x0, Re, tau_mom=TOL_MOM, tau_mass=TOL_MASS, n_max=N_
         elapsed = time.perf_counter() - t0
         return a, b, n_max, elapsed
 
-def load_surrogate_model(cfg, device="cpu"):
+def load_surrogate_model(cfg, solver, device="cpu"):
+    """
+    Load trained NeuralOperator from checkpoint.
+
+    IMPORTANT: We must set up geometry and projection BEFORE loading state_dict
+    because the checkpoint contains projection layer weights.
+    We use strict=False to ignore projection keys since we rebuild from solver.
+    """
     model = NeuralOperator(
         n_nodes=N_NODES,
         hidden=cfg.get("hidden_dim", 64),
         layers=cfg.get("gnn_layers", 4),
         k=cfg.get("stencil_k", 25),
         eps=float(cfg.get("projection_eps", 1e-8)),
-    )
-    if CHECKPOINT_PATH.exists():
-        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
-        model.eval().to(device)
-        return model
-    return None
+    ).to(device)
 
-def predict_surrogate(model, Re, solver, cfg, device="cpu"):
+    # Setup geometry first
     points = solver.points
     stencils = build_stencils(points, cfg.get("stencil_k", 25)).to(device)
-    edge_dst = stencils.reshape(-1)
-    edge_src = torch.arange(N_NODES, device=device).repeat_interleave(cfg.get("stencil_k", 25))
-    edge_index = torch.stack([edge_dst, edge_src])
-
     model.set_points(points, stencils)
+
+    # Setup projection BEFORE loading state_dict
     G = solver.G_int.to(device)
     interior_mask = solver.interior_dof_mask.to(device)
     interior_node_mask = solver.is_int.to(device)
     model.set_projection(G, interior_mask=interior_mask, interior_node_mask=interior_node_mask)
 
+    # Now load checkpoint - strict=False because checkpoint has projection.G, projection.chol
+    # which we already rebuilt from the solver
+    if CHECKPOINT_PATH.exists():
+        state = torch.load(CHECKPOINT_PATH, map_location=device)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print("      Warning: Missing keys:", missing)
+        if unexpected:
+            print("      Note: Ignored unexpected keys:", unexpected)
+        model.eval()
+        return model
+    return None
+
+def predict_surrogate(model, Re, cfg, device="cpu"):
+    """Run inference for a single Re value."""
     re_max = cfg.get("re_max", 100.0)
     mu = torch.tensor([Re / re_max], dtype=torch.float32, device=device)
+
+    # Build edge_index from model's stored points and stencils
+    points = model.points
+    N = points.shape[0]
+    k = cfg.get("stencil_k", 25)
+    stencils = build_stencils(points, k).to(device)
+    edge_dst = stencils.reshape(-1)
+    edge_src = torch.arange(N, device=device).repeat_interleave(k)
+    edge_index = torch.stack([edge_dst, edge_src])
 
     with torch.no_grad():
         a_NO, _ = model.predict(mu, edge_index)
@@ -156,7 +180,7 @@ def main():
     print("      Iterations:", iter_zero_df, ", Time:", round(t_zero_df, 3), "s")
 
     print("[4/4] Condition C: Surrogate warm-start")
-    model = load_surrogate_model(cfg, device=device)
+    model = load_surrogate_model(cfg, solver=solver, device=device)
 
     if model is None:
         warnings.warn("Checkpoint not found at " + str(CHECKPOINT_PATH) + ". Skipping Condition C.")
@@ -164,7 +188,8 @@ def main():
         t_surrogate = None
         decomp = {}
     else:
-        a_pred = predict_surrogate(model, Re=RE, solver=solver, cfg=cfg, device=device)
+        print("      Model loaded successfully")
+        a_pred = predict_surrogate(model, Re=RE, cfg=cfg, device=device)
         eps_div = verify_divergence_free(a_pred, solver)
         print("      Post-projection eps_div:", "{:.3e}".format(eps_div))
         _, _, iter_surrogate, t_surrogate = solve_with_init(solver, a_pred, Re=RE)
