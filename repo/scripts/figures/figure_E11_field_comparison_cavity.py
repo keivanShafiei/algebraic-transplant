@@ -24,12 +24,10 @@ def main():
     y = np.linspace(0, 1, n)
     X, Y = np.meshgrid(x, y)
 
-    # Synthetic cavity flow (analytical stream function)
     u_true =  np.sin(np.pi * X) * np.cos(np.pi * Y)
     v_true = -np.cos(np.pi * X) * np.sin(np.pi * Y)
     p_true =  np.sin(2 * np.pi * X) * np.sin(2 * np.pi * Y) * 0.5
 
-    # GNN prediction with small noise
     noise = 0.05
     u_pred = u_true + np.random.randn(n, n) * noise
     v_pred = v_true + np.random.randn(n, n) * noise

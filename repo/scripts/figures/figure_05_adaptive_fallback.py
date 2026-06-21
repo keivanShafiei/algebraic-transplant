@@ -23,7 +23,6 @@ def main():
     n_values = np.array([225, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000])
     cond_numbers = n_values ** 1.2 * 1e-2 + np.random.randn(len(n_values)) * n_values * 0.01
 
-    # Dense threshold ~10,000; sparse above
     threshold = 10000
     is_dense = n_values <= threshold
     is_sparse = n_values > threshold
@@ -39,7 +38,7 @@ def main():
 $N = {threshold}$', fontsize=8, color='gray', ha='left')
 
     ax.set_xlabel('Number of nodes $N$')
-    ax.set_ylabel('Condition number $\kappa(\mathbf{G}\mathbf{G}^T)$')
+    ax.set_ylabel(r'Condition number $\kappa(\mathbf{G}\mathbf{G}^T)$')
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlim(150, 200000)

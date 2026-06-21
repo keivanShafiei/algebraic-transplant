@@ -1,4 +1,4 @@
-"""Figure 7: Large-scale PCG scalability (N = 100,000).
+"""Figure 7: Large-scale PCG scalability with complexity reference lines.
 
 Reproduces Table 17: timing and memory at industrial scale.
 """
@@ -23,27 +23,37 @@ def main():
     time_s = np.array([0.05, 0.25, 0.55, 1.1, 1.8, 3.08])
     memory_gb = np.array([0.02, 0.08, 0.15, 0.25, 0.35, 0.45])
 
+    # Reference lines
+    n_ref = np.array([1000, 100000])
+    t_on = time_s[0] * (n_ref / n_values[0])      # O(N)
+    t_osq = time_s[0] * (n_ref / n_values[0]) ** 2  # O(N²)
+
     fig, axes = setup_figure(width=3.5, height=2.5, nrows=1, ncols=2)
 
     ax = axes[0, 0]
-    ax.plot(n_values, time_s, 'o-', color=COLORS['blue'], linewidth=1.5, markersize=6)
+    ax.plot(n_values, time_s, 'o-', color=COLORS['blue'], linewidth=1.5, markersize=6, label='Measured')
+    ax.plot(n_ref, t_on, ':', color=COLORS['gray'], linewidth=1.0, label=r'$\mathcal{O}(N)$')
+    ax.plot(n_ref, t_osq, '--', color=COLORS['gray'], linewidth=1.0, alpha=0.5, label=r'$\mathcal{O}(N^2)$')
     ax.set_xlabel('Number of nodes $N$')
     ax.set_ylabel('Wall-clock time (s)')
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlim(800, 150000)
-    ax.set_ylim(0.03, 5.0)
+    ax.set_ylim(0.03, 50.0)
+    ax.legend(loc='upper left', fontsize=8)
     ax.grid(True, alpha=0.3, which='both')
     add_panel_label(ax, 'a')
 
     ax = axes[0, 1]
-    ax.plot(n_values, memory_gb, 's-', color=COLORS['orange'], linewidth=1.5, markersize=6)
+    ax.plot(n_values, memory_gb, 's-', color=COLORS['orange'], linewidth=1.5, markersize=6, label='Measured')
+    ax.plot(n_ref, memory_gb[0] * (n_ref / n_values[0]), ':', color=COLORS['gray'], linewidth=1.0, label=r'$\mathcal{O}(N)$')
     ax.set_xlabel('Number of nodes $N$')
     ax.set_ylabel('VRAM (GB)')
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlim(800, 150000)
-    ax.set_ylim(0.01, 1.0)
+    ax.set_ylim(0.01, 5.0)
+    ax.legend(loc='upper left', fontsize=8)
     ax.grid(True, alpha=0.3, which='both')
     add_panel_label(ax, 'b')
 
