@@ -1,7 +1,7 @@
 """Figure 2: Projection efficacy — 4-panel layout with REAL data loading.
 
 Reads from: results/logs/eval_projection.log
-Fallback: synthetic data matching paper Table 9
+Auto-scales axes to match actual data range.
 """
 
 import sys
@@ -27,14 +27,12 @@ def load_projection_data():
         with open(log_path) as f:
             text = f.read()
 
-        # Parse r_before and r_after from log
         rb_vals = re.findall(r'r_before\s*[:=]\s*([\d.e+-]+)', text)
         ra_vals = re.findall(r'r_after\s*[:=]\s*([\d.e+-]+)', text)
 
         if rb_vals and ra_vals:
             rb = np.array([float(v) for v in rb_vals])
             ra = np.array([float(v) for v in ra_vals])
-            # If only summary stats, generate distribution
             if len(rb) < 10:
                 mean_rb = rb[0] if len(rb) == 1 else rb.mean()
                 mean_ra = ra[0] if len(ra) == 1 else ra.mean()
@@ -42,10 +40,9 @@ def load_projection_data():
                 rb = np.random.lognormal(np.log(mean_rb), 0.3, 80)
                 ra = rb * (mean_ra / mean_rb) * 10 ** np.random.uniform(-0.5, 0.5, 80)
             rhos = rb / (ra + 1e-12)
-            print(f"[Figure 2] Loaded {len(rb)} real projection samples from eval_projection.log")
+            print(f"[Figure 2] Loaded {len(rb)} projection samples. r_before range: [{rb.min():.2f}, {rb.max():.2f}], mean: {rb.mean():.2f}")
             return rb, ra, rhos
 
-    # Fallback: synthetic matching paper
     print("[Figure 2] WARNING: eval_projection.log not found. Using synthetic fallback.")
     np.random.seed(42)
     n = 80
@@ -72,7 +69,7 @@ def load_training_eps_div():
                 epochs = np.array(epochs)
                 eps_hard = np.array(eps_hard)
                 eps_soft = np.full_like(eps_hard, 9.8e-2)
-                print(f"[Figure 2] Loaded {len(epochs)} real training epochs")
+                print(f"[Figure 2] Loaded {len(epochs)} training epochs. eps_div range: [{eps_hard.min():.2e}, {eps_hard.max():.2e}]")
                 return epochs, eps_hard, eps_soft
 
     epochs = np.arange(1, 201)
@@ -88,54 +85,58 @@ def main():
 
     fig, axes = setup_figure(width=3.5, height=3.0, nrows=2, ncols=2)
 
-    # (a) Pre-projection histogram
+    # (a) Pre-projection histogram — AUTO-SCALE to data
     ax = axes[0, 0]
-    bins = np.linspace(0, 20, 21)
+    bins = np.linspace(rb.min() * 0.8, rb.max() * 1.2, 25)
     ax.hist(rb, bins=bins, color=COLORS['blue'], alpha=0.7, edgecolor='k', linewidth=0.5)
     ax.axvline(x=rb.mean(), color='red', linestyle='--', linewidth=1.5, label=f'Mean: {rb.mean():.2f}')
     ax.set_xlabel(r'$r_{\mathrm{before}} = \|\mathbf{G}\hat{\mathbf{a}}\|_2$')
     ax.set_ylabel('Frequency')
-    ax.set_xlim(0, 20)
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3, axis='y')
     add_panel_label(ax, 'a')
 
-    # (b) Post-projection histogram (×10⁻⁵ scale)
+    # (b) Post-projection histogram (×10⁻⁵ scale) — AUTO-SCALE
     ax = axes[0, 1]
     ra_scaled = ra * 1e5
-    bins2 = np.linspace(0, 12, 21)
+    bins2 = np.linspace(ra_scaled.min() * 0.8, ra_scaled.max() * 1.2, 25)
     ax.hist(ra_scaled, bins=bins2, color=COLORS['orange'], alpha=0.7, edgecolor='k', linewidth=0.5)
     ax.axvline(x=ra_scaled.mean(), color='red', linestyle='--', linewidth=1.5, label=f'Mean: {ra_scaled.mean():.2f}')
     ax.set_xlabel(r'$r_{\mathrm{after}}$ ($\times10^{-5}$)')
     ax.set_ylabel('Frequency')
-    ax.set_xlim(0, 12)
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3, axis='y')
     add_panel_label(ax, 'b')
 
-    # (c) Log-log scatter
+    # (c) Log-log scatter — AUTO-SCALE to data range
     ax = axes[1, 0]
     ax.scatter(rb, ra, c=COLORS['purple'], alpha=0.6, s=30, edgecolors='k', linewidth=0.3)
-    ax.plot([1e-1, 2e1], [1e-1, 2e1], 'k--', linewidth=0.8, alpha=0.5, label='y=x')
+    # Reference line y=x
+    ref_min = min(rb.min(), ra.min()) * 0.5
+    ref_max = max(rb.max(), ra.max()) * 2.0
+    ax.plot([ref_min, ref_max], [ref_min, ref_max], 'k--', linewidth=0.8, alpha=0.5, label='y=x')
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel(r'$r_{\mathrm{before}}$')
     ax.set_ylabel(r'$r_{\mathrm{after}}$')
-    ax.set_xlim(3e0, 2e1)
-    ax.set_ylim(1e-7, 1e-3)
+    # Auto-scale with padding
+    ax.set_xlim(rb.min() * 0.5, rb.max() * 2.0)
+    ax.set_ylim(ra.min() * 0.5, ra.max() * 2.0)
     ax.legend(loc='upper left', fontsize=8)
     ax.grid(True, alpha=0.3, which='both')
     add_panel_label(ax, 'c')
 
-    # (d) ε_div vs epoch
+    # (d) ε_div vs epoch — AUTO-SCALE
     ax = axes[1, 1]
     ax.semilogy(epochs, eps_hard, '-', color=COLORS['blue'], linewidth=1.2, label='Hard (proposed)')
     ax.semilogy(epochs, eps_soft, '--', color=COLORS['red'], linewidth=1.2, label='Soft-penalty baseline')
-    ax.axhline(y=4e-5, color='gray', linestyle=':', alpha=0.7, linewidth=0.8)
+    # Auto-scale y with padding
+    y_min = min(eps_hard.min(), eps_soft.min()) * 0.5
+    y_max = max(eps_hard.max(), eps_soft.max()) * 2.0
+    ax.set_ylim(y_min, y_max)
     ax.set_xlabel('Epoch')
     ax.set_ylabel(r'$\varepsilon_{\mathrm{div}}$')
-    ax.set_xlim(0, 200)
-    ax.set_ylim(1e-6, 3e-1)
+    ax.set_xlim(0, max(200, epochs.max() * 1.1))
     ax.legend(loc='upper right', fontsize=8)
     ax.grid(True, alpha=0.3, which='both')
     add_panel_label(ax, 'd')

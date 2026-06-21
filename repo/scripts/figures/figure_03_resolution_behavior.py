@@ -1,6 +1,6 @@
-"""Figure 3: Resolution behavior with real data loading.
+"""Figure 3: Resolution behavior with robust data loading.
 
-Data source: eval_zeroshot.py output (NOT available in current environment)
+Data source: eval_zeroshot.py output (may be empty/invalid)
 Fallback: synthetic data matching paper Section 4.1
 """
 
@@ -19,26 +19,42 @@ from scripts.figures.utils import (
 )
 
 def load_resolution_data():
-    """Load resolution transfer data."""
+    """Load resolution transfer data with robust error handling."""
 
-    # Check for zero-shot results
     data_paths = [
         'results/logs/zeroshot_results.json',
         'results/zeroshot_results.json',
     ]
     for p in data_paths:
-        if os.path.exists(p):
-            import json
-            with open(p) as f:
-                d = json.load(f)
-            N_vals = np.array(d['N'])
-            solver_err = np.array(d.get('solver_err', []))
-            no_err = np.array(d.get('no_err', []))
-            print(f"[Figure 3] Loaded real zero-shot data from {p}")
-            return N_vals, solver_err, no_err
+        if os.path.exists(p) and os.path.getsize(p) > 10:
+            try:
+                import json
+                with open(p) as f:
+                    d = json.load(f)
 
-    # Fallback: synthetic matching paper
-    print("[Figure 3] WARNING: No zero-shot data found. Using synthetic fallback.")
+                # Validate data
+                if not isinstance(d, dict):
+                    raise ValueError("JSON is not a dict")
+
+                N_vals = d.get('N')
+                if N_vals is None or len(N_vals) == 0:
+                    raise ValueError("No N values in JSON")
+
+                N_vals = np.array(N_vals)
+                solver_err = np.array(d.get('solver_err', []))
+                no_err = np.array(d.get('no_err', []))
+
+                if len(solver_err) == 0 or len(no_err) == 0:
+                    raise ValueError("Empty arrays in JSON")
+
+                print(f"[Figure 3] Loaded real zero-shot data from {p}")
+                return N_vals, solver_err, no_err
+            except Exception as e:
+                print(f"[Figure 3] WARNING: Failed to load {p}: {e}")
+                continue
+
+    # Fallback
+    print("[Figure 3] Using synthetic fallback.")
     N_vals = np.array([225, 1000, 5000, 10000])
     h_vals = 1.0 / np.sqrt(N_vals)
     h0 = h_vals[0]
