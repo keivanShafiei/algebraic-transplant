@@ -66,7 +66,7 @@ def main():
         # 1. گرفتن اسکیل واقعی (Scale) از حل‌گر برای این Re
         # (در کاربرد واقعی می‌توان از میانگین اسکیل‌های ترینینگ استفاده کرد، اما اینجا دقیق کار می‌کنیم)
         with torch.no_grad():
-            a_ref, b_ref = solver.solve(Re=re, n_max=500)
+            a_ref, b_ref, _ = solver.solve(Re=re, n_max=500)
             a_scale = a_ref.abs().max().item() + 1e-8
             b_scale = b_ref.abs().max().item() + 1e-8
             
