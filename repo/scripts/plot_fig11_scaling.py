@@ -60,7 +60,7 @@ def time_solver(N: int, Re: float, config: dict, device: torch.device,
     times = []
     for _ in range(n_repeat):
         t0 = time.perf_counter()
-        solver.solve(Re=Re, tau_mom=1e-2, n_max=100, verbose=False)
+        _ = solver.solve(Re=Re, tau_mom=1e-2, n_max=100, verbose=False)
         times.append(time.perf_counter() - t0)
     return min(times)  # best-of-n برای حذف jitter
 
