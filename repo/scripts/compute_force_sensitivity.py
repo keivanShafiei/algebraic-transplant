@@ -1,8 +1,8 @@
 """
 compute_force_sensitivity.py
-Computes the sensitivity coefficients  A, B, C  from the force error
-upper bound (Proposition~\\ref{prop:force_error_bound}) using the
-RBF-FD stencil and boundary quadrature.
+Computes the sensitivity coefficients A, B, C from the force error
+upper bound (Proposition~\ref{prop:force_error_bound}) using the
+NavierStokesSolver API.
 
 Usage:
     python scripts/compute_force_sensitivity.py
@@ -11,16 +11,17 @@ Outputs:
     results/force_sensitivity.json
 
 Dependencies:
-    rbffd_solver.py  (from /repo/)
-    numpy, scipy, json
+    src.rbf_fd.solver (NavierStokesSolver)
+    numpy, scipy, json, torch
 """
 
 import numpy as np
-import scipy.sparse.linalg as spl
+import scipy.sparse as sp
 import json
 import os
 import sys
 import logging
+import torch
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -28,11 +29,8 @@ logger = logging.getLogger(__name__)
 REPO_ROOT = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, REPO_ROOT)
 
-try:
-    from rbffd_solver import RBFFDSolver
-except ImportError as e:
-    logger.error(f"Cannot import RBFFDSolver: {e}")
-    sys.exit(1)
+from src.rbf_fd.solver import NavierStokesSolver
+from src.data.cavity import generate_cavity_points
 
 # ---- Paper constants -------------------------------------------------------
 EPS_VEL   = 0.1375    # 13.75% observed velocity error
@@ -41,7 +39,70 @@ DRAG_OBS  = 30.03     # mean drag error (%) from Table tab:force_errors
 DRAG_THRESHOLD = 5.0  # engineering tolerance (%)
 N_REF     = 225
 RE_REF    = 50
-NU        = 1.0 / RE_REF
+
+
+def build_solver(n_nodes: int = N_REF, k: int = 25, device: str = "cpu"):
+    """Build NavierStokesSolver with cavity points."""
+    points = generate_cavity_points(n_nodes).to(device)
+    return NavierStokesSolver(points, k=k)
+
+
+def compute_boundary_gradient_matrix(solver):
+    """
+    Construct boundary gradient operator D_Gamma from solver operators.
+
+    For the lid-driven cavity, boundary nodes are lid + walls.
+    We approximate the wall-normal gradient using the divergence operator
+    components on boundary nodes.
+
+    Returns:
+        D_Gamma: np.ndarray, shape (N_boundary, 2N)
+    """
+    # Boundary node indices
+    bnd_mask = ~(solver.is_int)
+    bnd_idx = bnd_mask.nonzero(as_tuple=True)[0].cpu().numpy()
+
+    # The divergence operator G = [Gx, Gy] gives us partial derivatives
+    # Gx = d/dx of basis functions, Gy = d/dy of basis functions
+    # For boundary gradient in normal direction, we use the components
+    # For lid (y=1): normal = (0, 1) → use Gy rows
+    # For walls: normal varies
+
+    # Simplified: use G_full restricted to boundary nodes
+    G_bnd = solver.G_full[bnd_idx].cpu().numpy()  # (N_bnd, 2N)
+
+    return G_bnd, bnd_idx
+
+
+def integration_weights_boundary(solver):
+    """
+    Approximate boundary quadrature weights.
+    For uniform cavity grid, use equal weights scaled by arc length.
+    """
+    bnd_mask = ~(solver.is_int)
+    bnd_idx = bnd_mask.nonzero(as_tuple=True)[0]
+    n_bnd = len(bnd_idx)
+
+    # Unit square perimeter = 4, but we exclude corners counted once
+    # Approximate: each boundary segment has length ~1
+    # For N=225 (15x15), boundary has ~4*15 - 4 = 56 nodes
+    # Average spacing along boundary ~4/56 ≈ 0.07
+    weights = torch.ones(n_bnd, dtype=torch.float32, device=solver.device)
+    weights = weights * (4.0 / n_bnd)  # scale by perimeter/node_count
+
+    return weights.cpu().numpy()
+
+
+def reference_solution(solver, Re: float):
+    """
+    Compute reference solution by running the solver.
+
+    Returns:
+        a_ref: np.ndarray, shape (2N,)
+        b_ref: np.ndarray, shape (N,)
+    """
+    a_ref, b_ref, _ = solver.solve(Re=Re, tau_mom=1e-2, tau_mass=1e-4, n_max=1000)
+    return a_ref.cpu().numpy(), b_ref.cpu().numpy()
 
 
 def compute_sensitivity_coefficients(N: int, Re: float) -> dict:
@@ -58,29 +119,35 @@ def compute_sensitivity_coefficients(N: int, Re: float) -> dict:
     dict with C_D, C_p, A, B, and derived quantities
     """
     nu = 1.0 / Re
-    solver = RBFFDSolver(N=N, domain='cavity', k=25)
-    solver.assemble()
+    solver = build_solver(n_nodes=N, k=25)
 
-    # Boundary quadrature weights  (shape: N_partial,)
-    w = solver.integration_weights_boundary()         # 1D array
+    # Boundary quadrature weights
+    w = integration_weights_boundary(solver)
 
-    # Wall-normal gradient matrix on boundary  (shape: N_partial x 2N)
-    D_Gamma = solver.boundary_gradient_matrix()
+    # Boundary gradient matrix
+    D_Gamma, bnd_idx = compute_boundary_gradient_matrix(solver)
 
-    # Reference solution fields (for normalization)
-    a_ref, b_ref = solver.reference_solution(Re=Re)   # velocity, pressure at wall
-    F_ref = float(w @ (nu * D_Gamma @ a_ref - b_ref))
+    # Reference solution
+    a_ref, b_ref = reference_solution(solver, Re=Re)
+
+    # Extract boundary pressure
+    b_ref_bnd = b_ref[bnd_idx]
+
+    # Reference drag force: F_D = ∫ (ν ∂u/∂n - p n_y) ds
+    # Simplified: F_ref = w · (ν * D_Gamma @ a_ref - b_ref_bnd)
+    F_ref = float(w @ (nu * D_Gamma @ a_ref - b_ref_bnd))
+
     if abs(F_ref) < 1e-12:
         raise ValueError(
             f"Reference drag force |F_ref|={abs(F_ref):.2e} is near zero. "
             "Check boundary conditions or solver output."
         )
 
-    # Coefficient C_D = ||nu * w^T D_Gamma||_2  (spectral norm of a row vector → 2-norm)
-    wD = nu * w @ D_Gamma          # shape: (2N,)
+    # Coefficient C_D = ||ν * w^T D_Gamma||_2 * ||a_ref||_2 / |F_ref|
+    wD = nu * w @ D_Gamma  # shape: (2N,)
     C_D = float(np.linalg.norm(wD, 2)) * float(np.linalg.norm(a_ref, 2)) / abs(F_ref)
 
-    # Coefficient C_p = ||w||_1 (L1 norm of quadrature weights)
+    # Coefficient C_p = ||w||_1 * ||b_ref||_1 / |F_ref|
     C_p = float(np.linalg.norm(w, 1)) * float(np.linalg.norm(b_ref, 1)) / abs(F_ref)
 
     # Operator-gap contribution (upper bound)
@@ -92,9 +159,8 @@ def compute_sensitivity_coefficients(N: int, Re: float) -> dict:
     )
 
     # Predicted drag error at observed velocity error
-    # (using pressure error = 0 for lower bound — conservative)
     pred_drag_lower = C_D * EPS_VEL + C_op_times_delta
-    pred_drag_upper = C_D * EPS_VEL + C_p * EPS_VEL + C_op_times_delta  # proxy
+    pred_drag_upper = C_D * EPS_VEL + C_p * EPS_VEL + C_op_times_delta
 
     # Threshold: eps_vel such that bound ≤ DRAG_THRESHOLD
     if C_D > 0:
