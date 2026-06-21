@@ -141,39 +141,34 @@ def main():
 
     cfg = load_config()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    print("Device:", device)
 
-    print(f"
-[1/4] Assembling solver at Re={RE}, N={N_NODES}...")
-    solver = build_solver(n_nodes=N_NODES, k=cfg.get("stencil_k", 25), 
-                          eps=float(cfg.get("projection_eps", 1e-8)), device=device)
-    print(f"      Interior nodes: {solver.is_int.sum().item()}/{solver.N}")
+    print("[1/4] Assembling solver at Re=" + str(RE) + ", N=" + str(N_NODES) + "...")
+    solver = build_solver(n_nodes=N_NODES, k=cfg.get("stencil_k", 25), eps=float(cfg.get("projection_eps", 1e-8)), device=device)
+    print("      Interior nodes:", solver.is_int.sum().item(), "/", solver.N)
 
-    print("
-[2/4] Condition A: Cold start")
+    print("[2/4] Condition A: Cold start")
     _, _, iter_cold, t_cold = solve_with_init(solver, np.zeros(2*N_NODES), Re=RE)
-    print(f"      Iterations: {iter_cold}, Time: {t_cold:.3f}s")
+    print("      Iterations:", iter_cold, ", Time:", round(t_cold, 3), "s")
 
-    print("
-[3/4] Condition B: Div-free zero field")
+    print("[3/4] Condition B: Div-free zero field")
     _, _, iter_zero_df, t_zero_df = solve_with_init(solver, np.zeros(2*N_NODES), Re=RE)
-    print(f"      Iterations: {iter_zero_df}, Time: {t_zero_df:.3f}s")
+    print("      Iterations:", iter_zero_df, ", Time:", round(t_zero_df, 3), "s")
 
-    print("
-[4/4] Condition C: Surrogate warm-start")
+    print("[4/4] Condition C: Surrogate warm-start")
     model = load_surrogate_model(cfg, device=device)
 
     if model is None:
-        warnings.warn(f"Checkpoint not found at {CHECKPOINT_PATH}. Skipping Condition C.")
+        warnings.warn("Checkpoint not found at " + str(CHECKPOINT_PATH) + ". Skipping Condition C.")
         iter_surrogate = None
         t_surrogate = None
         decomp = {}
     else:
         a_pred = predict_surrogate(model, Re=RE, solver=solver, cfg=cfg, device=device)
         eps_div = verify_divergence_free(a_pred, solver)
-        print(f"      Post-projection eps_div: {eps_div:.3e}")
+        print("      Post-projection eps_div:", "{:.3e}".format(eps_div))
         _, _, iter_surrogate, t_surrogate = solve_with_init(solver, a_pred, Re=RE)
-        print(f"      Iterations: {iter_surrogate}, Time: {t_surrogate:.3f}s")
+        print("      Iterations:", iter_surrogate, ", Time:", round(t_surrogate, 3), "s")
         decomp = compute_decomposition(iter_cold, iter_zero_df, iter_surrogate)
 
     result = {
@@ -197,8 +192,8 @@ def main():
     with open(OUTPUT_JSON, "w") as f:
         json.dump(result, f, indent=2)
 
-    print("
-" + "=" * 60)
+    print("")
+    print("=" * 60)
     print("Results:")
     print(json.dumps(result, indent=2))
     print("=" * 60)
