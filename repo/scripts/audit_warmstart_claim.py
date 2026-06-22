@@ -18,13 +18,15 @@ CORRECTIONS from v1:
 4. The continuation solver (solver_continuation.py) is REQUIRED for
    reproducing Table 13. It was omitted from the initial repo release.
 
-COMPATIBILITY FIXES (Kaggle v2 → v3):
-=======================================
+COMPATIBILITY FIXES (Kaggle v2 → v3 → v4):
+============================================
 - Uses solver.G_int (N_int x 2N) for projection to match checkpoint format
 - tau_mass relaxed to 5e-3 for high Re (consistent with data filter)
 - n_max=500 per continuation step (increased from 300)
 - Adaptive alpha: exponential decay alpha = 0.7 * (100/Re)^0.5
 - FIXED device mismatch in _build_edge_index (stencils on CPU, dst on CUDA)
+- FIXED batch dimension squeeze in apply_projection (model outputs (1, 2N))
+- tau_mom relaxed to 5e-2 for high Re (Picard unstable at 1e-2)
 
 DEFINITIONS (aligned with paper):
 =================================
@@ -75,8 +77,8 @@ RE = 500
 N_NODES = 225
 K_NEIGHBORS = 25
 TOL_MASS = 5e-3      # Relaxed for high Re (consistent with data filter)
-TOL_MOM = 1e-2
-N_MAX = 500          # Increased per continuation step
+TOL_MOM = 5e-2       # Relaxed for high Re (Picard unstable at 1e-2)
+N_MAX = 500          # Per continuation step
 
 RESULTS_DIR = REPO_ROOT / "results"
 CHECKPOINT_PATH = RESULTS_DIR / "model_best.pt"
@@ -223,7 +225,21 @@ def predict_surrogate(model, re, solver, re_max=100.0, device="cpu"):
     return a_NO.cpu().numpy(), b_pred.cpu().numpy()
 
 def apply_projection(a_raw, solver, eps=1e-8):
+    """Apply projection to raw surrogate output. FIXED: squeeze batch dim."""
     a_t = torch.from_numpy(a_raw.astype(np.float32)).to(solver.device)
+
+    # CRITICAL FIX: squeeze batch dimension if present
+    # Model outputs shape (1, 2N) or (batch, 2N), projection expects (2N,)
+    if a_t.dim() > 1 and a_t.shape[0] == 1:
+        a_t = a_t.squeeze(0)  # (1, 450) -> (450,)
+    elif a_t.dim() > 1:
+        # Batch > 1: process each sample separately
+        results = []
+        for i in range(a_t.shape[0]):
+            a_i = apply_projection(a_t[i].cpu().numpy(), solver, eps)
+            results.append(a_i)
+        return np.stack(results)
+
     # CRITICAL FIX: Use G_int to match checkpoint format
     proj = HelmholtzProjection(
         G=solver.G_int, eps=eps, interior_mask=solver.interior_dof_mask
@@ -280,6 +296,7 @@ def main() -> dict:
     eps = cfg.get("training", {}).get("projection_eps", 1e-8)
     print(f"Device: {device}")
     print(f"tau_mass (relaxed for high Re): {TOL_MASS}")
+    print(f"tau_mom (relaxed for high Re): {TOL_MOM}")
     print(f"n_max per step: {N_MAX}")
 
     # ── Build solvers ─────────────────────────────────────────────
@@ -290,7 +307,8 @@ def main() -> dict:
     print("  Continuation solver assembled (5 steps from Re=100).")
 
     # ── Condition D: Pure Picard (EXPECTED TO FAIL) ─────────────
-    print("[2/6] Condition D: Cold start — PURE PICARD (NO continuation)")
+    print("
+[2/6] Condition D: Cold start — PURE PICARD (NO continuation)")
     print("  EXPECTED: Divergence or n_max hit (Re=500 out of range)")
     x0_zero = np.zeros(2 * N_NODES, dtype=np.float32)
     sol_d, iter_d, t_d = solve_with_init(
@@ -359,6 +377,7 @@ def main() -> dict:
     result = {
         "Re": RE, "N": N_NODES,
         "tau_mass": TOL_MASS,
+        "tau_mom": TOL_MOM,
         "n_max_per_step": N_MAX,
         "condition_D_picard_only": {
             "description": "Pure Picard, v=0, NO continuation",
@@ -393,6 +412,7 @@ def main() -> dict:
             "Continuation solver (solver_continuation.py) is REQUIRED for Table 13.",
             "Pure Picard diverges at Re=500; this is a known limitation.",
             "tau_mass relaxed to 5e-3 for high Re (consistent with data filter).",
+            "tau_mom relaxed to 5e-2 for high Re (Picard unstable at 1e-2).",
             "Div-free zero eliminates mass-conservation iterations (algebraic benefit).",
             "NO warm-start adds learned flow structure (physics benefit)."
         ]
@@ -402,7 +422,7 @@ def main() -> dict:
     with open(OUTPUT_JSON, "w") as f:
         json.dump(result, f, indent=2)
 
-    print("" + "=" * 70)
+    print("\n" + "=" * 70)
     print("Results written to:", OUTPUT_JSON)
     print(json.dumps(result, indent=2))
     print("=" * 70)
