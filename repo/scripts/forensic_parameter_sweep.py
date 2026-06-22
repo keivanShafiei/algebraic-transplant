@@ -2,41 +2,16 @@
 """forensic_parameter_sweep.py — Find parameters that reproduce Table 13.
 
 If the "real solver" is indeed the Picard solver in the repository, then
-Table 13 must be reproducible with SOME combination of:
-- alpha (relaxation factor)
-- tau_mom (momentum tolerance)
-- tau_mass (mass conservation tolerance)
-- n_max (max iterations)
+Table 13 must be reproducible with SOME combination of parameters.
+This script performs a grid search over alpha, tau_mom, tau_mass, n_max.
 
-This script performs a grid search over these parameters.
-If NO combination reproduces the paper's claims, we conclude the data
-was fabricated or a different solver was used.
-
-SWEEP SPACE:
-============
-alpha:    [0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7]
-tau_mom:  [1e-1, 5e-2, 1e-2, 5e-3]
-tau_mass: [1e-2, 5e-3, 1e-3, 1e-4]
-n_max:    [100, 500, 1000, 2000]
-
-Total combinations: 7 × 4 × 4 × 4 = 448
-
-For each combination, we test:
-1. Cold start (v=0) at Re=500
-2. Check if converges within n_max
-3. Record iteration count
-
-Then we check if ANY combination matches:
-- Cold start: ~500 iterations
-- Div-free zero: ~145 iterations  
-- NO warm-start: ~120 iterations
+FIX: NavierStokesSolver has alpha=0.7 hardcoded. We subclass to make it configurable.
 """
 
 import os
 import sys
 import json
 import time
-import warnings
 from itertools import product
 from pathlib import Path
 
@@ -49,7 +24,6 @@ import torch
 from src.rbf_fd.solver import NavierStokesSolver
 from src.projection.layer import HelmholtzProjection
 
-# ── Configuration ────────────────────────────────────────────────────────────
 RE = 500
 N_NODES = 225
 K_NEIGHBORS = 25
@@ -60,38 +34,67 @@ TAU_MOM_VALUES = [1e-1, 5e-2, 1e-2, 5e-3]
 TAU_MASS_VALUES = [1e-2, 5e-3, 1e-3, 1e-4]
 N_MAX_VALUES = [100, 500, 1000, 2000]
 
-RESULTS_DIR = REPO_ROOT / "results"
-OUTPUT_JSON = RESULTS_DIR / "forensic_sweep_results.json"
-
-# Paper claims
 PAPER_COLD = 500
 PAPER_ZERO = 145
 PAPER_NO = 120
 
-TOLERANCE = 0.20  # 20% tolerance for "match"
+TOLERANCE = 0.20
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def make_grid_points(n: int = N_NODES, device: str = "cpu") -> torch.Tensor:
+class NavierStokesSolverPatched(NavierStokesSolver):
+    """Patched solver with configurable alpha."""
+
+    def __init__(self, *args, alpha=0.7, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = alpha
+
+    def solve(self, Re, x0=None, tau_mom=1e-2, tau_mass=1e-4,
+              n_max=100, verbose=False):
+        """Patched solve with configurable alpha."""
+        nu = 1.0 / Re
+        if x0 is not None:
+            a = x0.clone().to(dtype=torch.float32, device=self.device)
+        else:
+            a = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
+        b = torch.zeros(self.N, dtype=torch.float32, device=self.device)
+
+        for n in range(n_max):
+            K = self._assemble_momentum_operator(a, nu)
+            a_star = torch.linalg.solve(K, self.F)
+            a_new, b_new_int = self._project(a_star)
+            mom_res = self._momentum_residual(a_new, b_new_int, nu)
+            div_res = (self.G_int @ a_new).norm().item()
+
+            if verbose:
+                print(f" iter {n:3d} mom={mom_res:.2e} div={div_res:.2e}")
+
+            if mom_res < tau_mom and div_res < tau_mass:
+                a = a_new
+                b[self.is_int] = b_new_int
+                break
+
+            a = self.alpha * a_new + (1 - self.alpha) * a
+
+        b_full = b
+        return a, b_full, n + 1
+
+
+def make_grid_points(n=225, device="cpu"):
     side = int(round(n ** 0.5))
-    assert side * side == n
     xs = torch.linspace(0.0, 1.0, side)
     ys = torch.linspace(0.0, 1.0, side)
     gx, gy = torch.meshgrid(xs, ys, indexing="ij")
     pts = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
     return pts.to(torch.float32).to(device)
 
-def build_solver(device: str = "cpu"):
+def build_solver(alpha=0.7, device="cpu"):
     points = make_grid_points(N_NODES, device=device)
-    return NavierStokesSolver(points=points, k=K_NEIGHBORS)
+    return NavierStokesSolverPatched(points=points, k=K_NEIGHBORS, alpha=alpha)
 
 def solve_with_params(solver, re, x0, alpha, tau_mom, tau_mass, n_max):
-    """Solve with custom alpha (monkey-patch solver's alpha)."""
     if isinstance(x0, np.ndarray):
         x0 = torch.from_numpy(x0.astype(np.float32)).to(solver.device)
 
-    # Monkey-patch alpha for this solve
-    original_alpha = solver.alpha
     solver.alpha = alpha
 
     try:
@@ -103,13 +106,10 @@ def solve_with_params(solver, re, x0, alpha, tau_mom, tau_mass, n_max):
     except Exception as e:
         n_iter = n_max
         converged = False
-    finally:
-        solver.alpha = original_alpha  # Restore
 
-    return a, n_iter, converged
+    return n_iter, converged
 
 def build_divfree_zero(solver):
-    """Build div-free zero field."""
     a = np.zeros(2 * solver.N, dtype=np.float32)
     lid_idx = solver.is_lid.nonzero(as_tuple=True)[0].cpu().numpy()
     a[2 * lid_idx] = 1.0
@@ -125,27 +125,24 @@ def build_divfree_zero(solver):
 
     return a_proj.cpu().numpy()
 
-# ── Main sweep ───────────────────────────────────────────────────────────────
-
 def main():
     print("=" * 70)
     print("FORENSIC PARAMETER SWEEP")
     print("=" * 70)
     print()
     print("Searching for parameter combinations that reproduce Table 13...")
-    print(f"Sweep space: {len(ALPHA_VALUES)} × {len(TAU_MOM_VALUES)} × {len(TAU_MASS_VALUES)} × {len(N_MAX_VALUES)} = {len(ALPHA_VALUES) * len(TAU_MOM_VALUES) * len(TAU_MASS_VALUES) * len(N_MAX_VALUES)} combinations")
+    total_combos = len(ALPHA_VALUES) * len(TAU_MOM_VALUES) * len(TAU_MASS_VALUES) * len(N_MAX_VALUES)
+    print(f"Sweep space: {len(ALPHA_VALUES)} × {len(TAU_MOM_VALUES)} × {len(TAU_MASS_VALUES)} × {len(N_MAX_VALUES)} = {total_combos} combinations")
     print()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    solver = build_solver(device=device)
 
     x0_zero = np.zeros(2 * N_NODES, dtype=np.float32)
-    x0_divfree = build_divfree_zero(solver)
 
     results = []
     matches = []
 
-    total = len(ALPHA_VALUES) * len(TAU_MOM_VALUES) * len(TAU_MASS_VALUES) * len(N_MAX_VALUES)
+    total = total_combos
     count = 0
 
     for alpha, tau_mom, tau_mass, n_max in product(ALPHA_VALUES, TAU_MOM_VALUES, TAU_MASS_VALUES, N_MAX_VALUES):
@@ -153,13 +150,13 @@ def main():
         if count % 50 == 0:
             print(f"  Progress: {count}/{total} ({count/total*100:.1f}%)")
 
-        # Test cold start
-        _, iter_cold, conv_cold = solve_with_params(
+        solver = build_solver(alpha=alpha, device=device)
+        x0_divfree = build_divfree_zero(solver)
+
+        iter_cold, conv_cold = solve_with_params(
             solver, RE, x0_zero, alpha, tau_mom, tau_mass, n_max
         )
-
-        # Test div-free zero
-        _, iter_zero, conv_zero = solve_with_params(
+        iter_zero, conv_zero = solve_with_params(
             solver, RE, x0_divfree, alpha, tau_mom, tau_mass, n_max
         )
 
@@ -173,7 +170,6 @@ def main():
         }
         results.append(result)
 
-        # Check if this matches paper claims
         if conv_cold and conv_zero:
             cold_diff = abs(iter_cold - PAPER_COLD) / PAPER_COLD
             zero_diff = abs(iter_zero - PAPER_ZERO) / PAPER_ZERO
@@ -194,7 +190,6 @@ def main():
     print("=" * 70)
     print()
 
-    # Convergence statistics
     converged_cold = sum(1 for r in results if r["cold_start"]["converged"])
     converged_zero = sum(1 for r in results if r["divfree_zero"]["converged"])
 
@@ -203,11 +198,10 @@ def main():
     print(f"Div-free zero converged: {converged_zero}/{len(results)} ({converged_zero/len(results)*100:.1f}%)")
     print()
 
-    # Best matches
     if matches:
         print(f"✅ FOUND {len(matches)} parameter combinations matching paper claims!")
         print()
-        for i, m in enumerate(matches[:5]):  # Show top 5
+        for i, m in enumerate(matches[:5]):
             print(f"Match {i+1}:")
             print(f"  alpha={m['params']['alpha']}, tau_mom={m['params']['tau_mom']:.0e}, tau_mass={m['params']['tau_mass']:.0e}, n_max={m['params']['n_max']}")
             print(f"  Cold start: {m['cold_start']} iter (diff={m['cold_diff_pct']:.1f}%)")
@@ -217,7 +211,6 @@ def main():
         print("❌ NO parameter combination matches paper claims.")
         print()
 
-        # Find closest matches
         closest = []
         for r in results:
             if r["cold_start"]["converged"] and r["divfree_zero"]["converged"]:
@@ -264,8 +257,9 @@ def main():
     print()
 
     # Save results
+    RESULTS_DIR = REPO_ROOT / "results"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_JSON, "w") as f:
+    with open(RESULTS_DIR / "forensic_sweep_results.json", "w") as f:
         json.dump({
             "sweep_space": {
                 "alpha": ALPHA_VALUES,
@@ -284,7 +278,7 @@ def main():
             "conclusion": "reproducible" if matches else "not_reproducible",
         }, f, indent=2)
 
-    print(f"Results saved to: {OUTPUT_JSON}")
+    print(f"Results saved to: {RESULTS_DIR / 'forensic_sweep_results.json'}")
     print("=" * 70)
 
 if __name__ == "__main__":
