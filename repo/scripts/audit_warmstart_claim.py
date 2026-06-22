@@ -119,6 +119,15 @@ def solve_with_init(
         n_max=n_max,
     )
     elapsed = time.perf_counter() - t0
+
+    if n_iter >= n_max:
+        warnings.warn(
+            f"AUDIT FLAG: solver did NOT converge within n_max={n_max} iterations "
+            f"at Re={re}. This solver is designed for Re in [10, 100] (training range). "
+            f"Table 13 results at Re=500 may not be reproducible with the Picard "
+            f"fixed-point scheme (alpha=0.7 relaxation) in this repo.",
+            stacklevel=2,
+        )
     return a, n_iter, elapsed
 
 
@@ -175,7 +184,8 @@ def load_surrogate(cfg: dict, solver: NavierStokesSolver,
     # Register node coordinates + stencil topology (Stencil Isomorphism)
     model.set_points(solver.points, solver.stencils)
     # Transplant the solver's interior-restricted G into the projection layer
-    model.set_projection(solver.G_full, solver.is_int)
+    model.set_projection(solver.G_full, solver.interior_dof_mask,
+        interior_node_mask=solver.is_int)
 
     state = torch.load(CHECKPOINT_PATH, map_location=device)
     model.load_state_dict(state)
@@ -221,7 +231,7 @@ def apply_projection(
     proj = HelmholtzProjection(
         G=solver.G_full,
         eps=eps,
-        interior_mask=solver.is_int,   # real attr name (bool tensor, shape N)
+        interior_mask=solver.interior_dof_mask,  # DOF mask shape (2N,)
     ).to(solver.device)
 
     with torch.no_grad():
