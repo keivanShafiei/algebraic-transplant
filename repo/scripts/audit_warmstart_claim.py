@@ -307,8 +307,7 @@ def main() -> dict:
     print("  Continuation solver assembled (5 steps from Re=100).")
 
     # ── Condition D: Pure Picard (EXPECTED TO FAIL) ─────────────
-    print("
-[2/6] Condition D: Cold start — PURE PICARD (NO continuation)")
+    print("\n[2/6] Condition D: Cold start — PURE PICARD (NO continuation)")
     print("  EXPECTED: Divergence or n_max hit (Re=500 out of range)")
     x0_zero = np.zeros(2 * N_NODES, dtype=np.float32)
     sol_d, iter_d, t_d = solve_with_init(
