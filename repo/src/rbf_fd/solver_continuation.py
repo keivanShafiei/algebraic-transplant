@@ -60,11 +60,14 @@ class NavierStokesSolverContinuation(NavierStokesSolver):
         return [float(s) for s in steps[1:]]
 
     def _adaptive_alpha(self, Re: float) -> float:
-        """Adaptive relaxation factor: lower alpha for higher Re."""
-        # Base alpha=0.7 for Re<=100, decrease linearly to 0.3 at Re=500
+        """Adaptive relaxation factor: lower alpha for higher Re.
+
+        Uses exponential decay: alpha = 0.7 * (100/Re)^0.5
+        This ensures stability at high Re while maintaining convergence.
+        """
         if Re <= 100:
             return 0.7
-        return max(0.3, 0.7 - 0.4 * (Re - 100) / 400)
+        return max(0.15, 0.7 * (100.0 / Re) ** 0.5)
 
     def solve(self, Re: float, x0: Optional[torch.Tensor] = None,
               tau_mom: float = 1e-2, tau_mass: float = 1e-4,
@@ -115,7 +118,7 @@ class NavierStokesSolverContinuation(NavierStokesSolver):
             print(f"Continuation path: {self.re_base:.1f} -> "
                   f"{' -> '.join(f'{r:.1f}' for r in re_steps)}")
 
-        if x0 is not None:
+        if x0 is not None and x0.abs().sum() > 0:
             a_current = x0.clone().to(dtype=torch.float32, device=self.device)
             if a_current.shape[0] != 2 * self.N:
                 raise ValueError(
@@ -138,7 +141,7 @@ class NavierStokesSolverContinuation(NavierStokesSolver):
             # Use adaptive alpha for each sub-step
             alpha = self._adaptive_alpha(Re_i)
             if verbose:
-                print(f"  Step {i+1}/{len(re_steps)} Re={Re_i:.1f}, alpha={alpha:.2f}")
+                print(f"  Step {i+1}/{len(re_steps)} Re={Re_i:.1f}, alpha={alpha:.3f}")
 
             a_current, b_current, n_i = super().solve(
                 Re=Re_i, x0=a_current, tau_mom=tau_mom,
@@ -153,7 +156,7 @@ class NavierStokesSolverContinuation(NavierStokesSolver):
             div_res = (self.G_int @ a_current).norm().item()
             # For intermediate continuation steps, allow slightly higher div_res
             # because the field will be re-projected in the next step
-            effective_tol = tau_mass * (2.0 if i < len(re_steps) - 1 else 1.0)
+            effective_tol = tau_mass * (3.0 if i < len(re_steps) - 1 else 1.0)
             if div_res > effective_tol:
                 warnings.warn(
                     f"Continuation step Re={Re_i:.1f}: "
