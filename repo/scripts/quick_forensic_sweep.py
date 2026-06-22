@@ -3,6 +3,9 @@
 
 Tests a smaller parameter space to quickly assess reproducibility.
 If this fails, the full sweep is unlikely to succeed.
+
+FIX: NavierStokesSolver has alpha=0.7 hardcoded in solve(), not as attribute.
+We subclass to make alpha configurable.
 """
 
 import os
@@ -32,6 +35,45 @@ N_MAX = 500
 PAPER_COLD = 500
 PAPER_ZERO = 145
 
+
+class NavierStokesSolverPatched(NavierStokesSolver):
+    """Patched solver with configurable alpha."""
+
+    def __init__(self, *args, alpha=0.7, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = alpha
+
+    def solve(self, Re, x0=None, tau_mom=1e-2, tau_mass=1e-4,
+              n_max=100, verbose=False):
+        """Patched solve with configurable alpha."""
+        nu = 1.0 / Re
+        if x0 is not None:
+            a = x0.clone().to(dtype=torch.float32, device=self.device)
+        else:
+            a = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
+        b = torch.zeros(self.N, dtype=torch.float32, device=self.device)
+
+        for n in range(n_max):
+            K = self._assemble_momentum_operator(a, nu)
+            a_star = torch.linalg.solve(K, self.F)
+            a_new, b_new_int = self._project(a_star)
+            mom_res = self._momentum_residual(a_new, b_new_int, nu)
+            div_res = (self.G_int @ a_new).norm().item()
+
+            if verbose:
+                print(f" iter {n:3d} mom={mom_res:.2e} div={div_res:.2e}")
+
+            if mom_res < tau_mom and div_res < tau_mass:
+                a = a_new
+                b[self.is_int] = b_new_int
+                break
+
+            a = self.alpha * a_new + (1 - self.alpha) * a
+
+        b_full = b
+        return a, b_full, n + 1
+
+
 def make_grid_points(n=225, device="cpu"):
     side = int(round(n ** 0.5))
     xs = torch.linspace(0.0, 1.0, side)
@@ -40,15 +82,14 @@ def make_grid_points(n=225, device="cpu"):
     pts = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
     return pts.to(torch.float32).to(device)
 
-def build_solver(device="cpu"):
+def build_solver(alpha=0.7, device="cpu"):
     points = make_grid_points(N_NODES, device=device)
-    return NavierStokesSolver(points=points, k=K_NEIGHBORS)
+    return NavierStokesSolverPatched(points=points, k=K_NEIGHBORS, alpha=alpha)
 
 def solve_with_params(solver, re, x0, alpha, tau_mom, tau_mass, n_max):
     if isinstance(x0, np.ndarray):
         x0 = torch.from_numpy(x0.astype(np.float32)).to(solver.device)
 
-    original_alpha = solver.alpha
     solver.alpha = alpha
 
     try:
@@ -60,8 +101,6 @@ def solve_with_params(solver, re, x0, alpha, tau_mom, tau_mass, n_max):
     except Exception as e:
         n_iter = n_max
         converged = False
-    finally:
-        solver.alpha = original_alpha
 
     return n_iter, converged
 
@@ -88,10 +127,8 @@ def main():
     print()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    solver = build_solver(device=device)
 
     x0_zero = np.zeros(2 * N_NODES, dtype=np.float32)
-    x0_divfree = build_divfree_zero(solver)
 
     results = []
     matches = []
@@ -102,6 +139,11 @@ def main():
 
     for alpha, tau_mom, tau_mass in product(ALPHA_VALUES, TAU_MOM_VALUES, TAU_MASS_VALUES):
         count += 1
+        if count % 10 == 0:
+            print(f"  Progress: {count}/{total}")
+
+        solver = build_solver(alpha=alpha, device=device)
+        x0_divfree = build_divfree_zero(solver)
 
         iter_cold, conv_cold = solve_with_params(
             solver, RE, x0_zero, alpha, tau_mom, tau_mass, N_MAX
@@ -128,6 +170,7 @@ def main():
                     "cold_diff": cold_diff * 100, "zero_diff": zero_diff * 100
                 })
 
+    print()
     print(f"Total combinations: {len(results)}")
     print(f"Cold start converged: {sum(1 for r in results if r['cold_start']['converged'])}/{len(results)}")
     print(f"Div-free zero converged: {sum(1 for r in results if r['divfree_zero']['converged'])}/{len(results)}")
@@ -161,8 +204,28 @@ def main():
             for c in closest[:5]:
                 print(f"  alpha={c['params'][0]}, tau_mom={c['params'][1]:.0e}, tau_mass={c['params'][2]:.0e}")
                 print(f"  Cold: {c['cold']} iter, Zero: {c['zero']} iter (avg diff={c['avg_diff']:.1f}%)")
+        else:
+            print("\nNo converged solutions found at all.")
+            print("This suggests the Picard solver is fundamentally unstable at Re=500")
+            print("regardless of parameters.")
 
     print()
+    print("=" * 70)
+
+    # Save results
+    RESULTS_DIR = REPO_ROOT / "results"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RESULTS_DIR / "forensic_quick_results.json", "w") as f:
+        json.dump({
+            "total_combinations": len(results),
+            "converged_cold": sum(1 for r in results if r['cold_start']['converged']),
+            "converged_zero": sum(1 for r in results if r['divfree_zero']['converged']),
+            "matches_found": len(matches),
+            "matches": matches,
+            "all_results": results,
+        }, f, indent=2)
+
+    print(f"Results saved to: {RESULTS_DIR / 'forensic_quick_results.json'}")
     print("=" * 70)
 
 if __name__ == "__main__":
