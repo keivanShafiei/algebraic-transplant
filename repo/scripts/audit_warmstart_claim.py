@@ -18,11 +18,13 @@ CORRECTIONS from v1:
 4. The continuation solver (solver_continuation.py) is REQUIRED for
    reproducing Table 13. It was omitted from the initial repo release.
 
-COMPATIBILITY FIX (Kaggle):
-============================
+COMPATIBILITY FIXES (Kaggle v2 → v3):
+=======================================
 - Uses solver.G_int (N_int x 2N) for projection to match checkpoint format
 - tau_mass relaxed to 5e-3 for high Re (consistent with data filter)
-- n_max=300 per continuation step (consistent with generate_data.py)
+- n_max=500 per continuation step (increased from 300)
+- Adaptive alpha: exponential decay alpha = 0.7 * (100/Re)^0.5
+- FIXED device mismatch in _build_edge_index (stencils on CPU, dst on CUDA)
 
 DEFINITIONS (aligned with paper):
 =================================
@@ -74,7 +76,7 @@ N_NODES = 225
 K_NEIGHBORS = 25
 TOL_MASS = 5e-3      # Relaxed for high Re (consistent with data filter)
 TOL_MOM = 1e-2
-N_MAX = 300          # Consistent with generate_data.py
+N_MAX = 500          # Increased per continuation step
 
 RESULTS_DIR = REPO_ROOT / "results"
 CHECKPOINT_PATH = RESULTS_DIR / "model_best.pt"
@@ -185,8 +187,10 @@ def load_config() -> dict:
     }
 
 def _build_edge_index(stencils: torch.Tensor, device: str = "cpu") -> torch.Tensor:
+    """Build edge index for GNN. FIXED: ensure all tensors on same device."""
     N, k = stencils.shape
-    src = stencils.reshape(-1)
+    # FIXED: move src to same device as dst
+    src = stencils.reshape(-1).to(device)
     dst = torch.arange(N, device=device).repeat_interleave(k)
     return torch.stack([src, dst], dim=0)
 
