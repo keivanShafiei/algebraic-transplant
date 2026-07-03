@@ -359,6 +359,27 @@ class NavierStokesSolver:
         except Exception:
             return self._solve_momentum_direct(K, F)
 
+    def _adaptive_relaxation(self, Re: float, base_alpha: float = 0.7) -> float:
+        """Adaptive relaxation factor: lower alpha for higher Re.
+
+        For Re > 200, the nonlinearity is stronger; a smaller relaxation
+        factor improves stability. Clamped to [0.3, 0.9].
+
+        Parameters
+        ----------
+        Re : float
+            Current Reynolds number.
+        base_alpha : float, optional
+            Base relaxation factor (default 0.7).
+
+        Returns
+        -------
+        float
+            Adaptive relaxation factor alpha.
+        """
+        alpha = base_alpha - 0.001 * max(0.0, Re - 100.0)
+        return float(np.clip(alpha, 0.3, 0.9))
+
     def solve(
         self,
         Re: float,
@@ -368,6 +389,7 @@ class NavierStokesSolver:
         n_max: int = 100,
         use_iterative: bool = True,
         mom_tol: float = 1e-6,
+        adaptive_relax: bool = True,
         verbose: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, int, list, list]:
         """Run the fractional-step solver to convergence with warm-start support.
@@ -390,6 +412,8 @@ class NavierStokesSolver:
             If False, use direct solve (torch.linalg.solve) — no warm-start.
         mom_tol : float, optional
             Inner tolerance for GMRES (default 1e-6).
+        adaptive_relax : bool, optional
+            If True, use adaptive relaxation factor based on Re.
         verbose : bool, optional
             Print per-iteration diagnostics.
 
@@ -409,8 +433,8 @@ class NavierStokesSolver:
 
         Notes
         -----
-        A relaxation factor of 0.7 is applied to the velocity update
-        (a <- 0.7 * a_new + 0.3 * a) for robustness at moderate Re.
+        A relaxation factor is applied to the velocity update
+        (a <- alpha * a_new + (1-alpha) * a) for robustness.
         For Re > 200 the solver may require more iterations; n_max should
         be increased accordingly.
         """
@@ -429,6 +453,9 @@ class NavierStokesSolver:
         b_int = torch.zeros(
             self.is_int.sum(), dtype=torch.float32, device=self.device
         )
+
+        # Adaptive relaxation
+        alpha = self._adaptive_relaxation(Re) if adaptive_relax else 0.7
 
         mom_history = []
         div_history = []
@@ -456,10 +483,10 @@ class NavierStokesSolver:
             iterations = n + 1
 
             if verbose:
-                print(f" iter {n:3d} mom={mom_res:.2e} div={div_res:.2e}")
+                print(f" iter {n:3d} mom={mom_res:.2e} div={div_res:.2e} alpha={alpha:.3f}")
 
-            # Relaxed update
-            a = 0.7 * a_new + 0.3 * a
+            # Relaxed update with adaptive alpha
+            a = alpha * a_new + (1.0 - alpha) * a
             b_int = b_new_int
 
             if mom_res < tau_mom and div_res < tau_mass:
@@ -471,3 +498,118 @@ class NavierStokesSolver:
         b_full = torch.zeros(self.N, dtype=torch.float32, device=self.device)
         b_full[self.is_int] = b_int
         return a, b_full, iterations, mom_history, div_history
+
+    def solve_continuation(
+        self,
+        Re_target: float,
+        Re_steps: list = None,
+        x0: torch.Tensor = None,
+        tau_mom: float = 1e-2,
+        tau_mass: float = 1e-4,
+        n_max_per_step: int = 100,
+        use_iterative: bool = True,
+        mom_tol: float = 1e-6,
+        adaptive_relax: bool = True,
+        verbose: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, list, list]:
+        """Continuation solver: ramp Re from low to target for robustness.
+
+        Solves the flow at a sequence of increasing Reynolds numbers,
+        using the solution at each step as the warm-start for the next.
+        This is the method used in the paper's Table 10 and is essential
+        for convergence at Re > 200.
+
+        Parameters
+        ----------
+        Re_target : float
+            Target Reynolds number (e.g., 500).
+        Re_steps : list, optional
+            Sequence of Re values. If None, auto-generated as:
+            [10, 20, 50, 100, 200, 300, 400, Re_target] for Re_target > 100.
+            For Re_target <= 100, uses [Re_target] directly.
+        x0 : torch.Tensor, optional
+            Initial guess for the FIRST step (Re_steps[0]). If None, zero.
+        tau_mom : float, optional
+            Momentum residual tolerance (default 1e-2).
+        tau_mass : float, optional
+            Divergence residual tolerance (default 1e-4).
+        n_max_per_step : int, optional
+            Maximum Picard iterations per continuation step (default 100).
+        use_iterative : bool, optional
+            Use GMRES with warm-start (default True).
+        mom_tol : float, optional
+            Inner GMRES tolerance (default 1e-6).
+        adaptive_relax : bool, optional
+            Adaptive relaxation factor (default True).
+        verbose : bool, optional
+            Print per-step and per-iteration diagnostics.
+
+        Returns
+        -------
+        a : torch.Tensor
+            Final velocity at Re_target, shape (2N,).
+        b_full : torch.Tensor
+            Final pressure at Re_target, shape (N,).
+        total_iterations : int
+            Sum of Picard iterations across all continuation steps.
+        mom_history : list
+            Flattened momentum residual history across all steps.
+        div_history : list
+            Flattened divergence residual history across all steps.
+
+        Notes
+        -----
+        This is the recommended solver for Re > 100 (extrapolation regime).
+        The paper's Table 10 reports iteration counts using this continuation
+        approach, not pure Picard at Re=500.
+        """
+        if Re_steps is None:
+            if Re_target <= 100:
+                Re_steps = [Re_target]
+            else:
+                # Auto-generate continuation steps
+                steps = [10.0, 20.0, 50.0, 100.0]
+                if Re_target > 100:
+                    steps.extend([200.0, 300.0, 400.0])
+                if Re_target > 400:
+                    steps.append(Re_target)
+                else:
+                    steps = [s for s in steps if s <= Re_target]
+                    if steps[-1] != Re_target:
+                        steps.append(Re_target)
+                Re_steps = steps
+
+        a_current = x0.clone() if x0 is not None else None
+        total_iterations = 0
+        all_mom_history = []
+        all_div_history = []
+
+        for step_idx, Re_step in enumerate(Re_steps):
+            if verbose:
+                print(f"\n[Continuation {step_idx+1}/{len(Re_steps)}] Re={Re_step:.1f}")
+
+            a, b_full, iters, mom_hist, div_hist = self.solve(
+                Re=Re_step,
+                x0=a_current,
+                tau_mom=tau_mom,
+                tau_mass=tau_mass,
+                n_max=n_max_per_step,
+                use_iterative=use_iterative,
+                mom_tol=mom_tol,
+                adaptive_relax=adaptive_relax,
+                verbose=verbose,
+            )
+
+            total_iterations += iters
+            all_mom_history.extend(mom_hist)
+            all_div_history.extend(div_hist)
+
+            # Use this solution as warm-start for next step
+            a_current = a.clone()
+
+            if verbose:
+                converged = (mom_hist[-1] < tau_mom) and (div_hist[-1] < tau_mass) if mom_hist else False
+                status = "CONVERGED" if converged else "NOT CONVERGED"
+                print(f"  -> {status} in {iters} iterations")
+
+        return a_current, b_full, total_iterations, all_mom_history, all_div_history
