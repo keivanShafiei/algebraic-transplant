@@ -1,26 +1,57 @@
-"""projection/layer.py — Differentiable Helmholtz Projection Layers (CRITICAL FIX).
+"""projection/layer.py — Differentiable Helmholtz Projection Layers.
 
-CRITICAL FIX (Phase 1, Task 2 corrected):
-When interior_mask is provided, the Cholesky factor must be computed from
-G[:, interior_mask] @ G[:, interior_mask].T, NOT from G @ G.T.
+This module implements the core Algebraic Transplant projection:
 
-Mathematical justification:
-- Without interior_mask: L = G @ G.T, q = L^{-1} @ G @ a_hat, a_NO = a_hat - G.T @ q
-- With interior_mask: L_int = G[:, interior] @ G[:, interior].T,
-  q = L_int^{-1} @ G @ a_hat, a_NO[interior] = a_hat[interior] - (G.T @ q)[interior]
+    q = (G G^T + eps*I)^{-1} G a_hat          (Lagrange multiplier)
+    a_NO = a_hat - G^T q                      (divergence-free velocity)
+    p_corr = b_pred + q                         (physical pressure, Eq. 18)
 
-Using G @ G.T instead of G[:, interior] @ G[:, interior].T causes:
-- div_norm ~ 1e+03 instead of ~4e-5
-- rho ~ 1e+01 instead of ~2e+05
-- Idempotency violation (diff ~ 20 instead of ~0)
-- Pythagorean identity violation
+Two implementations are provided:
 
-This fix ensures Proposition 4 (Boundary Invariance) AND Theorem 2
-(Divergence-Free Projection) are both satisfied.
+**HelmholtzProjection** (dense Cholesky)
+    Suitable for N up to ~10,000. Factorises L = G G^T + eps*I in float64
+    at construction time, then each forward call is a back-substitution.
+    Achieves eps_div ~ O(10^-13) in float64, ~ 4e-5 in float32 inference
+    (Remark 2, Table 9).
+
+**SparseHelmholtzProjection** (Jacobi-PCG)
+    Suitable for N up to 100,000+ (validated at N=100,000: 3.08 s, 0.45 GB
+    VRAM, eps_div < 1.89e-4, Section 3.4 and Table 17).
+    Matrix-free: only sparse mat-vec products. O(N) working memory.
+
+Both classes implement the same interface: forward(a_hat, return_q=False).
+
+Paper reference
+---------------
+Theorem 2 (Discrete Helmholtz Projection), Section 2.3, Eq. (11):
+
+    P_div(a_hat) := a_hat - G^T (L + eps*I)^{-1} G a_hat
+
+Properties verified by tests/test_projection.py:
+    (1) ||G P_div(a_hat)||_2 <= eps ||G a_hat||_2 / sigma_min(L)
+    (2) P_div minimises ||v - a_hat|| subject to G v = 0 (Pythagorean identity)
+    (3) P_div is differentiable (Jacobian eigenvalues in {0,1} to O(eps))
+    (+) P_div is idempotent: P_div(P_div(a)) = P_div(a)
+
+True Algebraic Transplant — Interior Restriction (Section 4.9, Proposition 4)
+---------------------------------------------------------------------------
+For boundary-safe projection, G must be the **interior-restricted** operator
+G_int (rows corresponding to interior nodes only). Using the full-domain
+G_full corrupts Dirichlet boundary velocities and produces ~74% drag error.
+
+The projection correction G^T q is applied **only** to interior DOFs:
+
+    a_NO[interior_dof_mask] = a_hat[interior_dof_mask] - G_int.T @ q
+    a_NO[boundary_dof_mask] = a_hat[boundary_dof_mask]              (unchanged)
+
+The interior_dof_mask has shape (2N,) where N is the total number of nodes.
+G_int has shape (N_int, 2N) where N_int is the number of interior nodes.
+
+The NavierStokesSolver automatically exposes solver.G_int for this purpose.
 """
 
 from __future__ import annotations
-from typing import Tuple
+from typing import Optional
 import torch
 import torch.nn as nn
 
@@ -33,81 +64,92 @@ def _as_column(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
 
 
 class HelmholtzProjection(nn.Module):
-    """Dense Cholesky-based Helmholtz projection layer with boundary-safe masking.
+    """Dense Cholesky-based Helmholtz projection layer with interior restriction.
 
-    Implements the Algebraic Transplant projection with interior restriction:
+    Implements the Algebraic Transplant projection with boundary-safe
+    interior restriction (Proposition 4, Section 4.9):
 
-        q = (G[:, interior]^T G[:, interior] + eps*I)^{-1} G a_hat   [float64 Cholesky]
-        a_NO = a_hat - G^T q                                         [divergence-free output]
-        WHERE correction is applied ONLY to interior DOFs (Proposition 4)
-        p_corr = b_pred + q                                          [via Eq. 18, external call]
+        q = (G_int G_int^T + eps*I)^{-1} G_int a_hat    [float64 Cholesky solve]
+        a_NO[interior] = a_hat[interior] - G_int.T @ q   [only interior DOFs]
+        a_NO[boundary] = a_hat[boundary]                 [unchanged]
 
-    CRITICAL FIX: The Cholesky factor is computed from G[:, interior_mask] @ G[:, interior_mask].T
-    when interior_mask is provided. Previously, G @ G.T was used, which caused:
-        - div_norm ~ 1e+03 (should be ~4e-5)
-        - rho ~ 1e+01 (should be ~2e+05)
-        - Broken idempotency and Pythagorean identity
+    The Cholesky factorisation of L = G G^T + eps*I is pre-computed in
+    float64 at construction time and stored as a buffer. Each forward
+    call performs only a back-substitution (O(N^2) for dense, versus
+    O(N^3) for a fresh factorisation).
+
+    Parameters
+    ----------
+    G : torch.Tensor
+        Discrete divergence operator, shape (N_rows, 2N) for interior-
+        restricted G_int, or (N, 2N) for full-domain G_full.
+        Assembled in float32; promoted to float64 internally.
+    eps : float, optional
+        Tikhonov regularisation. Default 1e-8 (Table 4 of the paper).
+        A small jitter of 1e-7 is added internally for Cholesky stability.
+    interior_dof_mask : torch.Tensor, optional
+        Boolean mask of shape (2N,) indicating interior velocity DOFs.
+        When provided, the projection correction is applied ONLY to
+        interior DOFs, preserving Dirichlet boundary conditions.
+        When None, falls back to legacy full-domain behavior (NOT recommended
+        for problems with non-trivial Dirichlet boundaries).
+
+    Attributes
+    ----------
+    G : torch.Tensor
+        Registered buffer holding the divergence operator (float32).
+    chol : torch.Tensor
+        Registered buffer holding the lower Cholesky factor of
+        L + eps*I in float64.
+    interior_dof_mask : torch.Tensor or None
+        Registered buffer for interior DOF mask (bool, shape (2N,)).
+
+    Notes
+    -----
+    Precision hierarchy (Remark 2):
+        - Cholesky factorisation: float64 -> eps_div ~ O(10^-13)
+        - forward() is called with float32 a_hat in training -> eps_div ~ 4e-5
+        This is arithmetic, not a design flaw.
+
+    The interior restriction is the **True Algebraic Transplant** that
+    eliminates the ~74% drag error from full-domain projection (Table 12).
     """
 
-    def __init__(self, G: torch.Tensor, eps: float = 1e-8,
-                 interior_mask: torch.Tensor = None):
+    def __init__(
+        self,
+        G: torch.Tensor,
+        eps: float = 1e-8,
+        interior_dof_mask: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
-
-        # Input validation
-        if not isinstance(G, torch.Tensor):
-            raise TypeError(f"G must be torch.Tensor, got {type(G)}")
-        if G.dim() != 2:
-            raise ValueError(f"G must be 2D, got shape {G.shape}")
-        if G.shape[0] > G.shape[1]:
-            raise ValueError(
-                f"G has more rows ({G.shape[0]}) than columns ({G.shape[1]}). "
-                f"Expected G to be (N_constraints, N_dof) with N_constraints <= N_dof."
-            )
-        if not torch.isfinite(G).all():
-            raise ValueError("G contains NaN or Inf values")
-
         self.eps = float(eps)
-        if self.eps <= 0:
-            raise ValueError(f"eps must be positive, got {eps}")
-
         self.register_buffer("G", G)
 
-        # Validate interior_mask
-        if interior_mask is not None:
-            if not isinstance(interior_mask, torch.Tensor):
-                raise TypeError(f"interior_mask must be torch.Tensor, got {type(interior_mask)}")
-            if interior_mask.dtype != torch.bool:
-                raise TypeError(f"interior_mask must be bool, got {interior_mask.dtype}")
-            expected_len = G.shape[1]
-            if interior_mask.shape[0] != expected_len:
+        # Register interior DOF mask for boundary-safe projection
+        if interior_dof_mask is not None:
+            if interior_dof_mask.dtype != torch.bool:
+                raise TypeError(
+                    f"interior_dof_mask must be bool, got {interior_dof_mask.dtype}"
+                )
+            if interior_dof_mask.dim() != 1:
                 raise ValueError(
-                    f"interior_mask length ({interior_mask.shape[0]}) must match "
-                    f"G columns ({expected_len})."
+                    f"interior_dof_mask must be 1D, got shape {interior_dof_mask.shape}"
                 )
-            n_interior = interior_mask.sum().item()
-            if n_interior == 0:
-                raise ValueError("interior_mask has no True values; all DOFs are boundary")
-            if n_interior == expected_len:
-                import warnings
-                warnings.warn(
-                    "interior_mask marks ALL DOFs as interior. "
-                    "This is equivalent to full-domain projection. "
-                    "Use interior_mask=None for clarity.",
-                    UserWarning,
+            expected_dof = G.shape[1]  # 2N
+            if interior_dof_mask.shape[0] != expected_dof:
+                raise ValueError(
+                    f"interior_dof_mask shape {interior_dof_mask.shape} does not match "
+                    f"expected DOF count {expected_dof} (2N for G shape {G.shape})"
                 )
-
-        self.interior_mask = interior_mask
-
-        # CRITICAL FIX: Compute Cholesky from G[:, interior] @ G[:, interior].T
-        # when interior_mask is provided.
-        if interior_mask is not None:
-            G_for_cholesky = G[:, interior_mask]  # (N_rows, N_interior_dof)
+            self.register_buffer(
+                "interior_dof_mask", interior_dof_mask.to(torch.bool)
+            )
         else:
-            G_for_cholesky = G  # (N_rows, 2N)
+            self.register_buffer("interior_dof_mask", None)
 
-        N_nodes = G_for_cholesky.shape[0]
+        N_nodes = G.shape[0]
         jitter = 1.0e-7
-        G64 = G_for_cholesky.to(torch.float64)
+        G64 = G.to(torch.float64)
         L64 = (G64 @ G64.T) + (self.eps + jitter) * torch.eye(
             N_nodes, dtype=torch.float64, device=G.device
         )
@@ -123,37 +165,39 @@ class HelmholtzProjection(nn.Module):
         Parameters
         ----------
         a_hat : torch.Tensor
-            Raw velocity coefficients, shape (2N,) or (2N, B).
+            Raw velocity coefficients from the GNN decoder,
+            shape (2N,) or (2N, B).
         return_q : bool, optional
-            If True, also return the correction vector q.
+            If True, also return the correction vector q (the discrete
+            Lagrange multiplier / pressure correction). Required for
+            pressure recovery: p_corr = b_pred + q (Eq. 18).
 
         Returns
         -------
         a_NO : torch.Tensor
             Divergence-free velocity, same shape as a_hat.
-            Boundary DOFs are unchanged when interior_mask is provided.
+            Boundary DOFs are unchanged when interior_dof_mask was provided.
         q : torch.Tensor (only if return_q=True)
-            Pressure correction vector.
+            Pressure correction vector, shape (N_rows,) or (N_rows, B).
         """
         a_col, squeezed = _as_column(a_hat)
 
-        # RHS: G @ a_hat (full divergence of raw prediction)
+        # Compute Lagrange multiplier q
         Ga = self.G @ a_col
-
-        # Solve: L_interior @ q = G @ a_hat
-        # where L_interior = G[:, interior] @ G[:, interior].T (pre-factored in __init__)
         q64 = torch.cholesky_solve(Ga.to(torch.float64), self.chol, upper=False)
         q = q64.to(a_col.dtype)
 
-        # Full correction vector: G^T @ q
-        # correction[interior] = (G^T @ q)[interior] = G[:, interior].T @ q
+        # Compute correction: G^T @ q
         correction = self.G.T @ q
 
-        # Apply correction ONLY to interior DOFs (Proposition 4)
-        if self.interior_mask is not None:
+        # Apply correction with interior restriction (Proposition 4)
+        if self.interior_dof_mask is not None:
+            # Boundary-safe: only apply correction to interior DOFs
             a_NO = a_col.clone()
-            a_NO[self.interior_mask] -= correction[self.interior_mask]
+            a_NO[self.interior_dof_mask] -= correction[self.interior_dof_mask]
+            # Boundary DOFs remain unchanged: a_NO[~mask] = a_col[~mask]
         else:
+            # Legacy full-domain behavior (NOT recommended for Dirichlet BCs)
             a_NO = a_col - correction
 
         a_NO = a_NO.squeeze(-1) if squeezed else a_NO
@@ -168,8 +212,38 @@ class HelmholtzProjection(nn.Module):
 class SparseHelmholtzProjection(nn.Module):
     """Jacobi-preconditioned CG projection for large-scale deployment.
 
-    CRITICAL FIX: When interior_mask is provided, the sparse matvec and
-    Jacobi preconditioner use G[:, interior_mask] instead of G.
+    Replaces the dense Cholesky solve with a matrix-free, iterative
+    Conjugate Gradient (CG) solve preconditioned by the Jacobi
+    (diagonal) preconditioner M = diag(G G^T + eps*I).
+
+    Complexity comparison:
+        HelmholtzProjection : O(N^2) memory (dense Cholesky factor)
+        SparseHelmholtzProjection: O(N) memory (only sparse G + diagonal M)
+
+    Empirical results (Section 3.4, Table 17):
+        N = 100,000 nodes: 3.08 s, 0.45 GB peak VRAM, eps_div < 1.89e-4
+        N = 49,207 (cylinder): 528 iterations, eps_div < 1e-4
+
+    The PCG replacement is architecturally invariant (Remark 6): G is still
+    transplanted exactly, the null space is unchanged, and l2-optimality
+    is preserved up to the CG convergence tolerance.
+
+    Parameters
+    ----------
+    G : torch.Tensor
+        Sparse COO divergence operator, shape (N_rows, 2N).
+        Must be a sparse tensor (G.is_sparse == True).
+    eps : float, optional
+        Tikhonov regularisation. Default 1e-8.
+    tol : float, optional
+        Relative CG residual tolerance. Default 1e-5.
+    max_iter : int, optional
+        Maximum CG iterations. Default 1500. For N=100,000, convergence
+        to 1e-4 requires ~1800 iterations (Figure 9 of the paper).
+    interior_dof_mask : torch.Tensor, optional
+        Boolean mask of shape (2N,) indicating interior velocity DOFs.
+        When provided, the projection correction is applied ONLY to
+        interior DOFs, preserving Dirichlet boundary conditions.
     """
 
     def __init__(
@@ -178,7 +252,7 @@ class SparseHelmholtzProjection(nn.Module):
         eps: float = 1e-8,
         tol: float = 1e-5,
         max_iter: int = 1500,
-        interior_mask: torch.Tensor = None,
+        interior_dof_mask: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         if not G.is_sparse:
@@ -186,66 +260,55 @@ class SparseHelmholtzProjection(nn.Module):
         self.eps = float(eps)
         self.tol = float(tol)
         self.max_iter = int(max_iter)
-        self.interior_mask = interior_mask
+
+        # Register interior DOF mask for boundary-safe projection
+        if interior_dof_mask is not None:
+            if interior_dof_mask.dtype != torch.bool:
+                raise TypeError(
+                    f"interior_dof_mask must be bool, got {interior_dof_mask.dtype}"
+                )
+            if interior_dof_mask.dim() != 1:
+                raise ValueError(
+                    f"interior_dof_mask must be 1D, got shape {interior_dof_mask.shape}"
+                )
+            expected_dof = G.shape[1]  # 2N
+            if interior_dof_mask.shape[0] != expected_dof:
+                raise ValueError(
+                    f"interior_dof_mask shape {interior_dof_mask.shape} does not match "
+                    f"expected DOF count {expected_dof} (2N for G shape {G.shape})"
+                )
+            self.register_buffer(
+                "interior_dof_mask", interior_dof_mask.to(torch.bool)
+            )
+        else:
+            self.register_buffer("interior_dof_mask", None)
 
         G = G.coalesce()
         self.register_buffer("G", G)
 
-        # CRITICAL FIX: Create G_interior for matvec and preconditioner
-        if interior_mask is not None:
-            # Extract interior columns from sparse G
-            idx = G.indices()  # (2, nnz)
-            val = G.values()
+        idx = G.indices()
+        val = G.values()
 
-            # Keep only entries where column index is in interior_mask
-            col_mask = interior_mask[idx[1]]
-            interior_idx = idx[:, col_mask]
-            interior_val = val[col_mask]
+        # Precompute G^T as a sparse tensor
+        GT = torch.sparse_coo_tensor(
+            idx[[1, 0], :], val, (G.shape[1], G.shape[0]),
+            device=G.device, dtype=G.dtype,
+        ).coalesce()
+        self.register_buffer("GT", GT)
 
-            G_interior = torch.sparse_coo_tensor(
-                interior_idx, interior_val,
-                (G.shape[0], interior_mask.sum().item()),
-                device=G.device, dtype=G.dtype,
-            ).coalesce()
-
-            self.register_buffer("G_interior", G_interior)
-
-            # G_interior.T as sparse tensor
-            GT_interior = torch.sparse_coo_tensor(
-                interior_idx[[1, 0], :], interior_val,
-                (interior_mask.sum().item(), G.shape[0]),
-                device=G.device, dtype=G.dtype,
-            ).coalesce()
-            self.register_buffer("GT_interior", GT_interior)
-
-            # Jacobi preconditioner from G_interior
-            diag = torch.zeros(G_interior.shape[0], dtype=val.dtype, device=val.device)
-            diag.index_add_(0, interior_idx[0], interior_val.square())
-        else:
-            # Full-domain: use original G
-            idx = G.indices()
-            val = G.values()
-
-            GT = torch.sparse_coo_tensor(
-                idx[[1, 0], :], val, (G.shape[1], G.shape[0]),
-                device=G.device, dtype=G.dtype,
-            ).coalesce()
-            self.register_buffer("GT", GT)
-
-            diag = torch.zeros(G.shape[0], dtype=val.dtype, device=val.device)
-            diag.index_add_(0, idx[0], val.square())
-            self.register_buffer("G_interior", G)
-            self.register_buffer("GT_interior", GT)
-
+        # Jacobi preconditioner: M_inv = 1 / diag(G G^T + eps*I)
+        # diag(G G^T)[i] = ||G[i,:]||^2 (sum of squares of row i)
+        diag = torch.zeros(G.shape[0], dtype=val.dtype, device=val.device)
+        diag.index_add_(0, idx[0], val.square())
         diag = diag + self.eps
         self.register_buffer("M_inv", diag.reciprocal())
 
     def _matvec_L(self, x: torch.Tensor) -> torch.Tensor:
-        """Matrix-vector product with L = G_interior @ G_interior.T + eps*I."""
+        """Matrix-vector product with L = G G^T + eps*I."""
         if x.dim() == 1:
             x = x.unsqueeze(-1)
-        y = torch.sparse.mm(self.GT_interior, x)
-        y = torch.sparse.mm(self.G_interior, y)
+        y = torch.sparse.mm(self.GT, x)
+        y = torch.sparse.mm(self.G, y)
         if self.eps != 0.0:
             y = y + self.eps * x
         return y
@@ -283,20 +346,41 @@ class SparseHelmholtzProjection(nn.Module):
         a_hat: torch.Tensor,
         return_q: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Project a_hat onto the discrete divergence-free manifold (PCG)."""
+        """Project a_hat onto the discrete divergence-free manifold (PCG).
+
+        Parameters
+        ----------
+        a_hat : torch.Tensor
+            Raw velocity coefficients, shape (2N,) or (2N, B).
+        return_q : bool, optional
+            If True, also return the pressure correction q.
+
+        Returns
+        -------
+        a_NO : torch.Tensor
+            Divergence-free velocity, same shape as a_hat.
+            Boundary DOFs are unchanged when interior_dof_mask was provided.
+        q : torch.Tensor (only if return_q=True)
+            Pressure correction vector.
+        """
         a_col, squeezed = _as_column(a_hat)
 
-        # RHS uses full G
+        # Compute Lagrange multiplier q via PCG
         rhs = torch.sparse.mm(self.G, a_col)
         q = self._cg(rhs)
         q_col, _ = _as_column(q)
-        correction = torch.sparse.mm(self.G.T, q_col)
 
-        # Apply correction ONLY to interior DOFs
-        if self.interior_mask is not None:
+        # Compute correction: G^T @ q
+        correction = torch.sparse.mm(self.GT, q_col)
+
+        # Apply correction with interior restriction (Proposition 4)
+        if self.interior_dof_mask is not None:
+            # Boundary-safe: only apply correction to interior DOFs
             a_NO = a_col.clone()
-            a_NO[self.interior_mask] -= correction[self.interior_mask]
+            a_NO[self.interior_dof_mask] -= correction[self.interior_dof_mask]
+            # Boundary DOFs remain unchanged
         else:
+            # Legacy full-domain behavior (NOT recommended for Dirichlet BCs)
             a_NO = a_col - correction
 
         a_NO = a_NO.squeeze(-1) if squeezed else a_NO
