@@ -129,10 +129,10 @@ def run_solver_continuation(solver, Re_target, x0, label, n_max_per_step=100, ve
 
 def print_history(label, mom_hist, div_hist, n_show=5):
     """Pretty-print residual history."""
-    print(f"INFO:   Mom residual history (first {n_show}): {[f\'{v:.2e}\' for v in mom_hist[:n_show]]}")
-    print(f"INFO:   Mom residual history (last {n_show}):  {[f\'{v:.2e}\' for v in mom_hist[-n_show:]]}")
-    print(f"INFO:   Div residual history (first {n_show}): {[f\'{v:.2e}\' for v in div_hist[:n_show]]}")
-    print(f"INFO:   Div residual history (last {n_show}):  {[f\'{v:.2e}\' for v in div_hist[-n_show:]]}")
+    print(f"INFO:   Mom residual history (first {n_show}): {[f'{v:.2e}' for v in mom_hist[:n_show]]}")
+    print(f"INFO:   Mom residual history (last {n_show}):  {[f'{v:.2e}' for v in mom_hist[-n_show:]]}")
+    print(f"INFO:   Div residual history (first {n_show}): {[f'{v:.2e}' for v in div_hist[:n_show]]}")
+    print(f"INFO:   Div residual history (last {n_show}):  {[f'{v:.2e}' for v in div_hist[-n_show:]]}")
 
 
 def main():
