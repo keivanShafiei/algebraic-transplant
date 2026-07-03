@@ -54,7 +54,7 @@ from .operators import (
 
 try:
     from scipy.sparse import csr_matrix
-    from scipy.sparse.linalg import gmres, LinearOperator
+    from scipy.sparse.linalg import gmres
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
@@ -323,11 +323,11 @@ class NavierStokesSolver:
         self,
         K: torch.Tensor,
         F: torch.Tensor,
-        a0: torch.Tensor,
+        x0: torch.Tensor,
         tol: float = 1e-6,
         maxiter: int = 200,
     ) -> torch.Tensor:
-        """Iterative solve via GMRES with warm-start (x0 = a0).
+        """Iterative solve via GMRES with warm-start (x0).
 
         Falls back to direct solve if scipy is unavailable or GMRES fails.
         """
@@ -337,10 +337,8 @@ class NavierStokesSolver:
         # Convert to numpy/scipy
         K_np = K.detach().cpu().numpy()
         F_np = F.detach().cpu().numpy()
-        x0_np = a0.detach().cpu().numpy()
+        x0_np = x0.detach().cpu().numpy()
 
-        # Build sparse matrix (K is dense in current implementation, but
-        # we can still use GMRES efficiently for N ~ 225)
         K_sparse = csr_matrix(K_np)
 
         try:
@@ -353,7 +351,6 @@ class NavierStokesSolver:
                 restart=min(50, K_sparse.shape[0]),
             )
             if info < 0:
-                # GMRES breakdown — fallback to direct
                 return self._solve_momentum_direct(K, F)
             a_star = torch.from_numpy(x_np).to(
                 dtype=torch.float32, device=self.device
@@ -365,21 +362,21 @@ class NavierStokesSolver:
     def solve(
         self,
         Re: float,
-        a0: torch.Tensor = None,
+        x0: torch.Tensor = None,
         tau_mom: float = 1e-2,
         tau_mass: float = 1e-4,
         n_max: int = 100,
         use_iterative: bool = True,
         mom_tol: float = 1e-6,
         verbose: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int, list, list]:
         """Run the fractional-step solver to convergence with warm-start support.
 
         Parameters
         ----------
         Re : float
             Reynolds number. Training range: Re in [10, 100].
-        a0 : torch.Tensor, optional
+        x0 : torch.Tensor, optional
             Initial guess for velocity, shape (2N,). If None, starts from zero.
             **Warm-start:** pass a_NO (GNN prediction) here to reduce iterations.
         tau_mom : float, optional
@@ -403,6 +400,12 @@ class NavierStokesSolver:
             ||G_int a||_2 < tau_mass at exit (by Theorem 1).
         b_full : torch.Tensor
             Pressure coefficient vector, shape (N,). Zero at boundary nodes.
+        iterations : int
+            Number of Picard iterations actually performed.
+        mom_history : list
+            History of momentum residuals (relative L2 norm).
+        div_history : list
+            History of divergence residuals (L2 norm of G_int @ a).
 
         Notes
         -----
@@ -413,19 +416,23 @@ class NavierStokesSolver:
         """
         nu = 1.0 / Re
 
-        # --- Warm-start: initialise from a0 if provided ---
-        if a0 is not None:
-            if a0.shape != (2 * self.N,):
+        # --- Warm-start: initialise from x0 if provided ---
+        if x0 is not None:
+            if x0.shape != (2 * self.N,):
                 raise ValueError(
-                    f"a0 must have shape {(2 * self.N,)}, got {a0.shape}"
+                    f"x0 must have shape {(2 * self.N,)}, got {x0.shape}"
                 )
-            a = a0.to(dtype=torch.float32, device=self.device).clone()
+            a = x0.to(dtype=torch.float32, device=self.device).clone()
         else:
             a = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
 
         b_int = torch.zeros(
             self.is_int.sum(), dtype=torch.float32, device=self.device
         )
+
+        mom_history = []
+        div_history = []
+        iterations = 0
 
         for n in range(n_max):
             K = assemble_momentum_operator(
@@ -444,6 +451,10 @@ class NavierStokesSolver:
             mom_res = self._momentum_residual(a_new, b_new_int, nu)
             div_res = (self.G_int @ a_new).norm().item()
 
+            mom_history.append(mom_res)
+            div_history.append(div_res)
+            iterations = n + 1
+
             if verbose:
                 print(f" iter {n:3d} mom={mom_res:.2e} div={div_res:.2e}")
 
@@ -459,4 +470,4 @@ class NavierStokesSolver:
 
         b_full = torch.zeros(self.N, dtype=torch.float32, device=self.device)
         b_full[self.is_int] = b_int
-        return a, b_full
+        return a, b_full, iterations, mom_history, div_history
