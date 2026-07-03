@@ -23,8 +23,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.rbf_fd.solver import NavierStokesSolver
 from src.data.cavity import generate_cavity_points
-from src.gnn.neural_operator import NeuralOperator
-from src.projection.layer import HelmholtzProjection
 
 
 def generate_div_free_zero(N, device):
@@ -77,7 +75,6 @@ def run_solver_direct(solver, Re, x0, label, n_max=100, verbose=False):
         tau_mass=1e-4,
         n_max=n_max,
         use_iterative=True,
-        adaptive_relax=True,
         verbose=verbose,
     )
     elapsed = time.time() - start
@@ -107,7 +104,6 @@ def run_solver_continuation(solver, Re_target, x0, label, n_max_per_step=100, ve
         tau_mass=1e-4,
         n_max_per_step=n_max_per_step,
         use_iterative=True,
-        adaptive_relax=True,
         verbose=verbose,
     )
     elapsed = time.time() - start
@@ -129,10 +125,12 @@ def run_solver_continuation(solver, Re_target, x0, label, n_max_per_step=100, ve
 
 def print_history(label, mom_hist, div_hist, n_show=5):
     """Pretty-print residual history."""
-    print(f"INFO:   Mom residual history (first {n_show}): {[f'{v:.2e}' for v in mom_hist[:n_show]]}")
-    print(f"INFO:   Mom residual history (last {n_show}):  {[f'{v:.2e}' for v in mom_hist[-n_show:]]}")
-    print(f"INFO:   Div residual history (first {n_show}): {[f'{v:.2e}' for v in div_hist[:n_show]]}")
-    print(f"INFO:   Div residual history (last {n_show}):  {[f'{v:.2e}' for v in div_hist[-n_show:]]}")
+    def fmt(vals):
+        return [f"{v:.2e}" for v in vals]
+    print(f"INFO:   Mom residual history (first {n_show}): {fmt(mom_hist[:n_show])}")
+    print(f"INFO:   Mom residual history (last {n_show}):  {fmt(mom_hist[-n_show:])}")
+    print(f"INFO:   Div residual history (first {n_show}): {fmt(div_hist[:n_show])}")
+    print(f"INFO:   Div residual history (last {n_show}):  {fmt(div_hist[-n_show:])}")
 
 
 def main():
@@ -153,7 +151,8 @@ def main():
     # ============================================================
     # TEST 1: Re=100 (within training range) — direct solver
     # ============================================================
-    print("\n############################################################")
+    print("
+############################################################")
     print("INFO: # TEST 1: Re=100 (within training range)")
     print("INFO: ############################################################")
 
@@ -167,10 +166,11 @@ def main():
     # ============================================================
     # TEST 2: Re=500 (extrapolation) — continuation solver
     # ============================================================
-    print("\n############################################################")
+    print("
+############################################################")
     print("INFO: # TEST 2: Re=500 (extrapolation)")
     print("INFO: ############################################################")
-    print("INFO: Using continuation solver (Re=10→20→50→100→200→300→400→500)")
+    print("INFO: Using continuation solver (Re=10->20->50->100->200->300->400->500)")
     print("INFO: Paper's Table 10 reports iteration counts with continuation.")
 
     # Cold start with continuation
@@ -205,7 +205,8 @@ def main():
     # ============================================================
     # TEST 3: Pure Picard comparison (for reference)
     # ============================================================
-    print("\n############################################################")
+    print("
+############################################################")
     print("INFO: # TEST 3: Pure Picard at Re=500 (paper footnote)")
     print("INFO: ############################################################")
     print("INFO: Paper footnote: pure Picard cold=3000, zero-df=500, surrogate=500")
@@ -218,7 +219,8 @@ def main():
     # ============================================================
     # TEST 4: Div-free property verification
     # ============================================================
-    print("\n############################################################")
+    print("
+############################################################")
     print("INFO: # TEST 4: Verify div-free property")
     print("INFO: ############################################################")
     zero_field = torch.zeros(2 * N, device=device)
@@ -229,7 +231,8 @@ def main():
     # ============================================================
     # SUMMARY
     # ============================================================
-    print("\n======================================================================")
+    print("
+======================================================================")
     print("INFO: WARM-START AUDIT SUMMARY")
     print("INFO: ==================================================================")
 
@@ -245,8 +248,8 @@ def main():
 
         # Speedup calculation
         speedup = res_cold_500['iters'] / max(1, res_surrogate_500['iters'])
-        print(f"INFO: [Re=500] Speedup (cold/surrogate): {speedup:.2f}×")
-        print(f"INFO: Paper claim: 4.2×")
+        print(f"INFO: [Re=500] Speedup (cold/surrogate): {speedup:.2f}x")
+        print(f"INFO: Paper claim: 4.2x")
 
     # Pure Picard comparison
     print(f"INFO: [Re=500] Pure Picard cold: {res_picard_cold['iters']} iters, converged={res_picard_cold['converged']}")
