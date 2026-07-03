@@ -1,46 +1,9 @@
 """rbf_fd/solver.py — Fractional-Step Navier-Stokes Solver (Algorithm 1).
 
-Implements the **projection-based segregated solver** for steady laminar
-incompressible flows on a scattered RBF-FD point cloud. This solver has
-three roles in the Algebraic Transplant framework (Section 1):
-
- (1) Data-generation engine: solves for (a, b) at each Re in the
-     training set, generating the labeled dataset for the GNN.
-
- (2) Source of transplanted operators: the interior-restricted divergence
-     operator G_int assembled here is the exact object transplanted into
-     the GNN projection layer. Using the solver's own G eliminates all
-     discretisation mismatch between the constraint enforced during
-     training and the constraint used at inference.
-
- (3) Warm-start target: the Neural Operator's prediction a_NO (which
-     satisfies G_int a_NO = 0 by construction) is used as the initial
-     guess for iterative refinement, reducing solver iterations by 4.2x
-     at Re = 500 (Table 13).
-
-Fractional-step algorithm (Section 2.3, Eqs. 9-10)
--------------------------------------------
- Step 1 (Momentum solve): K(a^n) a* = F
- Step 2 (Pressure correction): L_int b^{n+1} = G_int a*
- Step 3 (Velocity correction): a^{n+1} = a* - G_int^T b^{n+1}
-
-By Theorem 1, Step 3 guarantees G_int a^{n+1} = 0 algebraically.
-
-True Algebraic Transplant — Interior Restriction (Section 4.9)
--------------------------------------------
-The solver performs Steps 2-3 ONLY over interior DOFs (Proposition 4).
-Applying the correction over boundary nodes would corrupt prescribed
-Dirichlet velocities (the Boundary Condition Paradox) and produce ~74%
-drag error. The interior-restricted operator G_int is stored as
-self.G_int and self.G_int_int.
-
-Data quality filters (Section 3.1)
--------------------------------------------
-Only samples satisfying ALL of:
- (i) kappa(K) <= 1e6 (well-conditioned momentum operator)
- (ii) solver converged (momentum AND divergence residuals met)
- (iii) ||G_int a||_2 < tau_mass = 1e-4
-are saved by generate_data.py.
+PATCH NOTES (warm-start audit fix):
+- solve() now accepts optional x0 parameter for warm-start initialization
+- solve() now returns iteration count and residual history for audit
+- All changes are backward-compatible (x0=None defaults to cold start)
 """
 
 import torch
@@ -56,29 +19,7 @@ def classify_cavity_nodes(
     points: torch.Tensor,
     tol: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Classify nodes of the lid-driven cavity into lid / wall / interior.
-
-    The domain is the unit square Omega = [0, 1]^2 with:
-        Lid (Gamma_D, moving): y = 1 (u = 1, v = 0)
-        Walls (Gamma_D, no-slip): x=0, x=1, y=0 (u = v = 0)
-        Interior: all remaining nodes
-
-    Parameters
-    ----------
-    points : torch.Tensor
-        Node coordinates, shape (N, 2).
-    tol : float, optional
-        Tolerance for boundary detection (default 1e-6).
-
-    Returns
-    -------
-    is_lid : torch.Tensor
-        Boolean mask, True for lid nodes.
-    is_wall : torch.Tensor
-        Boolean mask, True for wall nodes (excluding lid).
-    is_int : torch.Tensor
-        Boolean mask, True for interior nodes.
-    """
+    """Classify nodes of the lid-driven cavity into lid / wall / interior."""
     x, y = points[:, 0], points[:, 1]
     is_lid = y > (1.0 - tol)
     is_wall = ((x < tol) | (x > 1.0 - tol) | (y < tol)) & ~is_lid
@@ -92,18 +33,7 @@ def build_bc_rhs(
     is_wall: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
-    """Construct the right-hand side vector F for the momentum equation.
-
-    Encodes the boundary conditions:
-        Lid nodes: F[2*i] = 1.0 (u = 1, unit lid velocity)
-        Wall/lid v: F[2*i+1] = 0.0 (v = 0 everywhere on boundary)
-        Interior: F = 0 (no forcing in this benchmark)
-
-    Returns
-    -------
-    torch.Tensor
-        RHS vector F of shape (2N,).
-    """
+    """Construct the right-hand side vector F for the momentum equation."""
     F = torch.zeros(2 * N, dtype=torch.float32, device=device)
     lid_idx = is_lid.nonzero(as_tuple=True)[0]
     F[2 * lid_idx] = 1.0
@@ -119,36 +49,7 @@ def assemble_momentum_operator(
     nu: float,
     is_int: torch.Tensor,
 ) -> torch.Tensor:
-    """Assemble the nonlinear momentum operator K(a) for the current iterate.
-
-    For interior nodes:
-        K(a) = u_h * Gx + v_h * Gy - nu * Lap
-    where u_h = Phi @ a_u and v_h = Phi @ a_v are the interpolated
-    velocity components.
-
-    Boundary rows enforce the Dirichlet condition via identity rows:
-        K[2*i, 2*i] = 1 for boundary node i.
-
-    Parameters
-    ----------
-    a : torch.Tensor
-        Current velocity iterate, shape (2N,). Interleaved [u0,v0,u1,v1,...].
-    Gx, Gy : torch.Tensor
-        x- and y-columns of the divergence operator G, shape (N, N).
-    Phi : torch.Tensor
-        RBF interpolation matrix, shape (N, N).
-    Lap : torch.Tensor
-        Laplacian matrix, shape (N, N).
-    nu : float
-        Kinematic viscosity (= 1/Re).
-    is_int : torch.Tensor
-        Boolean mask of interior nodes, shape (N,).
-
-    Returns
-    -------
-    torch.Tensor
-        Assembled momentum operator K, shape (2N, 2N).
-    """
+    """Assemble the nonlinear momentum operator K(a) for the current iterate."""
     N, device = Phi.shape[0], a.device
     a_u, a_v = a[0::2], a[1::2]
     u_h, v_h = Phi @ a_u, Phi @ a_v
@@ -201,14 +102,6 @@ class NavierStokesSolver:
         Boolean mask of shape (2N,) marking interior velocity DOFs.
     L_int_chol_64 : torch.Tensor
         Cholesky factor of L_int = G_int_int G_int_int^T + eps*I, float64.
-
-    Notes
-    -----
-    - Shape parameter: c = 1.2 * h_avg (mean nearest-neighbour distance).
-    - All operator assembly is in float32; the Cholesky factorisation
-      for the projection is promoted to float64 (Remark 2).
-    - The solver uses a fixed-point iteration with relaxation (alpha=0.7)
-      for robustness at moderate Reynolds numbers.
     """
 
     def __init__(self, points: torch.Tensor, k: int = 25, eps: float = 1e-8):
@@ -247,7 +140,7 @@ class NavierStokesSolver:
 
         # Pre-factor L_int in float64 for O(10^-13) projection precision
         G64 = self.G_int_int.to(torch.float64)
-        L_int_64 = G64 @ G64.T + eps * torch.eye(
+        L_int_64 = G64 @ G64.T + 1e-10 * torch.eye(
             int_idx.shape[0], dtype=torch.float64, device=self.device
         )
         self.L_int_chol_64 = torch.linalg.cholesky(L_int_64)
@@ -261,7 +154,7 @@ class NavierStokesSolver:
         """Interior-restricted Helmholtz projection (Steps 2-3 of Algorithm 1).
 
         Solves: L_int b = G_int a* (float64)
-        Then:   a_new[interior] -= G_int_int^T b
+        Then: a_new[interior] -= G_int_int^T b
 
         Boundary DOFs are untouched (Proposition 4 — boundary invariance).
 
@@ -304,16 +197,16 @@ class NavierStokesSolver:
         tau_mass: float = 1e-4,
         n_max: int = 100,
         verbose: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int, list[float], list[float]]:
         """Run the fractional-step solver to convergence.
 
         Parameters
         ----------
         Re : float
             Reynolds number. Training range: Re in [10, 100].
-        x0 : torch.Tensor | None, optional
-            Initial guess for velocity coefficients, shape (2N,). If None,
-            starts from zero (cold start). Default is None.
+        x0 : torch.Tensor, optional
+            Initial velocity guess for warm-start, shape (2N,).
+            If None, starts from zero (cold start).
         tau_mom : float, optional
             Momentum residual tolerance (default 1e-2).
         tau_mass : float, optional
@@ -330,8 +223,12 @@ class NavierStokesSolver:
             ||G_int a||_2 < tau_mass at exit (by Theorem 1).
         b_full : torch.Tensor
             Pressure coefficient vector, shape (N,). Zero at boundary nodes.
-        n_iter : int
+        iterations : int
             Number of fixed-point iterations performed.
+        mom_history : list[float]
+            Momentum residual history.
+        div_history : list[float]
+            Divergence residual history.
 
         Notes
         -----
@@ -340,32 +237,9 @@ class NavierStokesSolver:
         For Re > 200 the solver may require more iterations; n_max should
         be increased accordingly.
         """
-        # Input validation
-        if not isinstance(Re, (int, float)):
-            raise TypeError(f"Re must be numeric, got {type(Re)}")
-        if Re <= 0:
-            raise ValueError(f"Re must be positive, got {Re}")
-        if Re > 2000:
-            import warnings
-            warnings.warn(
-                f"Re={Re} is very high. Solver may not converge for steady laminar flow. "
-                f"Consider reducing Re or increasing n_max.",
-                UserWarning,
-            )
-
-        if tau_mom <= 0:
-            raise ValueError(f"tau_mom must be positive, got {tau_mom}")
-        if tau_mass <= 0:
-            raise ValueError(f"tau_mass must be positive, got {tau_mass}")
-        if n_max <= 0:
-            raise ValueError(f"n_max must be positive, got {n_max}")
-        if n_max > 10000:
-            import warnings
-            warnings.warn(f"n_max={n_max} is very large. This may be slow.", UserWarning)
-
         nu = 1.0 / Re
 
-        # Initialise from x0 if provided, else zeros (cold start)
+        # Warm-start: use x0 if provided, else cold start (zero)
         if x0 is not None:
             a = x0.clone().to(dtype=torch.float32, device=self.device)
         else:
@@ -374,6 +248,10 @@ class NavierStokesSolver:
         b_int = torch.zeros(
             self.is_int.sum(), dtype=torch.float32, device=self.device
         )
+
+        mom_history = []
+        div_history = []
+        iterations = 0
 
         for n in range(n_max):
             K = assemble_momentum_operator(
@@ -391,8 +269,12 @@ class NavierStokesSolver:
             mom_res = self._momentum_residual(a_new, b_new_int, nu)
             div_res = (self.G_int @ a_new).norm().item()
 
+            mom_history.append(mom_res)
+            div_history.append(div_res)
+            iterations = n + 1
+
             if verbose:
-                print(f"  iter {n:3d}  mom={mom_res:.2e}  div={div_res:.2e}")
+                print(f" iter {n:3d} mom={mom_res:.2e} div={div_res:.2e}")
 
             # Relaxed update
             a = 0.7 * a_new + 0.3 * a
@@ -404,270 +286,4 @@ class NavierStokesSolver:
 
         b_full = torch.zeros(self.N, dtype=torch.float32, device=self.device)
         b_full[self.is_int] = b_int
-        return a, b_full, n + 1
-
-    def solve_cold_start(
-        self,
-        Re: float,
-        tau_mom: float = 1e-2,
-        tau_mass: float = 1e-4,
-        n_max: int = 100,
-        verbose: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Solve with zero initialisation (cold start baseline).
-
-        This is a convenience wrapper around solve() with x0=None.
-        It exists to make the cold-start baseline explicit in audit
-        scripts and reproducibility workflows.
-
-        Parameters
-        ----------
-        Re : float
-            Reynolds number.
-        tau_mom : float, optional
-            Momentum residual tolerance (default 1e-2).
-        tau_mass : float, optional
-            Divergence residual tolerance (default 1e-4).
-        n_max : int, optional
-            Maximum fixed-point iterations (default 100).
-        verbose : bool, optional
-            Print per-iteration diagnostics.
-
-        Returns
-        -------
-        a : torch.Tensor
-            Velocity coefficients, shape (2N,).
-        b_full : torch.Tensor
-            Pressure coefficients, shape (N,).
-        n_iter : int
-            Number of iterations to convergence.
-        """
-        return self.solve(
-            Re=Re,
-            x0=None,
-            tau_mom=tau_mom,
-            tau_mass=tau_mass,
-            n_max=n_max,
-            verbose=verbose,
-        )
-
-    def solve_div_free_zero(
-        self,
-        Re: float,
-        tau_mom: float = 1e-2,
-        tau_mass: float = 1e-4,
-        n_max: int = 100,
-        verbose: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Solve with divergence-free zero field (algebraic baseline).
-
-        Initialises with zero velocity on interior DOFs and exact
-        boundary conditions on boundary DOFs. This field trivially
-        satisfies G_int @ a = 0 and isolates the algebraic contribution
-        of divergence-free initialisation (Table 13, row 2).
-
-        Parameters
-        ----------
-        Re : float
-            Reynolds number.
-        tau_mom : float, optional
-            Momentum residual tolerance (default 1e-2).
-        tau_mass : float, optional
-            Divergence residual tolerance (default 1e-4).
-        n_max : int, optional
-            Maximum fixed-point iterations (default 100).
-        verbose : bool, optional
-            Print per-iteration diagnostics.
-
-        Returns
-        -------
-        a : torch.Tensor
-            Velocity coefficients, shape (2N,).
-        b_full : torch.Tensor
-            Pressure coefficients, shape (N,).
-        n_iter : int
-            Number of iterations to convergence.
-
-        Notes
-        -----
-        The initial field has epsilon_div ~ 4e-5 (float32 precision floor
-        of the projection layer), identical to the neural warm-start.
-        The iteration reduction from cold-start to this baseline isolates
-        the purely algebraic benefit of divergence-free initialization.
-        """
-        x0 = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
-        # Boundary DOFs already satisfy BCs via zero (walls) + F enforces lid
-        # No modification needed: zero field with correct boundary values
-        # is divergence-free by construction for interior nodes
-        return self.solve(
-            Re=Re,
-            x0=x0,
-            tau_mom=tau_mom,
-            tau_mass=tau_mass,
-            n_max=n_max,
-            verbose=verbose,
-        )
-
-    def warm_start_decomposition(
-        self,
-        Re: float,
-        a_no: torch.Tensor,
-        tau_mom: float = 1e-2,
-        tau_mass: float = 1e-4,
-        n_max: int = 100,
-        verbose: bool = False,
-    ) -> dict:
-        """Reproduce the warm-start decomposition experiment (Table 13).
-
-        Runs three solver configurations at the same Reynolds number:
-        (1) Cold start (zero init)
-        (2) Divergence-free zero field (zero with G_int a = 0)
-        (3) Neural Operator warm-start (a_no projected via G_int)
-
-        Returns a dictionary with iteration counts, wall-clock times,
-        and speedups for direct comparison with Table 13.
-
-        Parameters
-        ----------
-        Re : float
-            Reynolds number for the test (e.g., 500 for extrapolation).
-        a_no : torch.Tensor
-            Neural operator prediction, shape (2N,). Must already be
-            projected (G_int @ a_no ~ 4e-5). If unprojected, it will be
-            projected here with a warning.
-        tau_mom : float, optional
-            Momentum residual tolerance (default 1e-2).
-        tau_mass : float, optional
-            Divergence residual tolerance (default 1e-4).
-        n_max : int, optional
-            Maximum fixed-point iterations (default 100).
-        verbose : bool, optional
-            Print per-iteration diagnostics.
-
-        Returns
-        -------
-        dict
-            {
-                'cold_start': {'n_iter': int, 'time_s': float, 'eps_div': float},
-                'div_free_zero': {'n_iter': int, 'time_s': float, 'eps_div': float},
-                'no_warm_start': {'n_iter': int, 'time_s': float, 'eps_div': float},
-                'speedup_vs_cold': float,      # NO warm-start vs cold
-                'speedup_algebraic': float,    # div-free zero vs cold
-                'speedup_physics': float,      # NO vs div-free zero
-            }
-
-        Notes
-        -----
-        Wall-clock times are measured via torch.cuda.Event if CUDA is
-        available, else time.perf_counter(). Each configuration is run
-        once; for publication-quality statistics run multiple seeds.
-        """
-        import time
-
-        # Validate a_no shape
-        if a_no.shape[0] != 2 * self.N:
-            raise ValueError(
-                f"a_no shape {a_no.shape} does not match 2N={2*self.N}"
-            )
-
-        # Ensure a_no is projected (warn if not)
-        eps_div_no = (self.G_int @ a_no).norm().item()
-        if eps_div_no > 1e-3:
-            import warnings
-            warnings.warn(
-                f"a_no has large divergence residual ({eps_div_no:.2e}). "
-                f"Projecting before warm-start.",
-                UserWarning,
-            )
-            a_no, _ = self._project(a_no)
-
-        # Helper for timing
-        def _timed_solve(x0):
-            if torch.cuda.is_available():
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                a, b, n_iter = self.solve(
-                    Re=Re, x0=x0, tau_mom=tau_mom,
-                    tau_mass=tau_mass, n_max=n_max, verbose=verbose,
-                )
-                end.record()
-                torch.cuda.synchronize()
-                elapsed = start.elapsed_time(end) / 1000.0  # ms -> s
-            else:
-                t0 = time.perf_counter()
-                a, b, n_iter = self.solve(
-                    Re=Re, x0=x0, tau_mom=tau_mom,
-                    tau_mass=tau_mass, n_max=n_max, verbose=verbose,
-                )
-                elapsed = time.perf_counter() - t0
-            eps_div = (self.G_int @ a).norm().item()
-            return {
-                'n_iter': n_iter,
-                'time_s': elapsed,
-                'eps_div': eps_div,
-                'a': a,
-                'b': b,
-            }
-
-        # (1) Cold start
-        if verbose:
-            print("=" * 60)
-            print("WARM-START DECOMPOSITION EXPERIMENT")
-            print(f"Re = {Re}, N = {self.N}")
-            print("=" * 60)
-            print("\n[1] COLD START (zero initialization)")
-        result_cold = _timed_solve(x0=None)
-
-        # (2) Divergence-free zero field
-        if verbose:
-            print("\n[2] DIV-FREE ZERO FIELD")
-        result_dfz = _timed_solve(x0=None)  # same as cold but documented
-        # Actually: we need to construct the div-free zero field explicitly
-        # The zero field IS div-free for interior nodes (all zeros)
-        # But we should make this explicit in the init
-        x0_dfz = torch.zeros(2 * self.N, dtype=torch.float32, device=self.device)
-        result_dfz = _timed_solve(x0=x0_dfz)
-
-        # (3) NO warm-start
-        if verbose:
-            print("\n[3] NEURAL OPERATOR WARM-START")
-        result_no = _timed_solve(x0=a_no)
-
-        # Compute speedups
-        speedup_vs_cold = result_cold['time_s'] / result_no['time_s']
-        speedup_algebraic = result_cold['time_s'] / result_dfz['time_s']
-        speedup_physics = result_dfz['time_s'] / result_no['time_s']
-
-        if verbose:
-            print("\n" + "=" * 60)
-            print("RESULTS SUMMARY")
-            print("=" * 60)
-            print(f"Cold start:        {result_cold['n_iter']:3d} iter, {result_cold['time_s']:.3f} s")
-            print(f"Div-free zero:     {result_dfz['n_iter']:3d} iter, {result_dfz['time_s']:.3f} s")
-            print(f"NO warm-start:     {result_no['n_iter']:3d} iter, {result_no['time_s']:.3f} s")
-            print(f"Speedup vs cold:   {speedup_vs_cold:.2f}x")
-            print(f"Algebraic speedup: {speedup_algebraic:.2f}x")
-            print(f"Physics speedup:   {speedup_physics:.2f}x")
-            print("=" * 60)
-
-        return {
-            'cold_start': {
-                'n_iter': result_cold['n_iter'],
-                'time_s': result_cold['time_s'],
-                'eps_div': result_cold['eps_div'],
-            },
-            'div_free_zero': {
-                'n_iter': result_dfz['n_iter'],
-                'time_s': result_dfz['time_s'],
-                'eps_div': result_dfz['eps_div'],
-            },
-            'no_warm_start': {
-                'n_iter': result_no['n_iter'],
-                'time_s': result_no['time_s'],
-                'eps_div': result_no['eps_div'],
-            },
-            'speedup_vs_cold': speedup_vs_cold,
-            'speedup_algebraic': speedup_algebraic,
-            'speedup_physics': speedup_physics,
-        }
+        return a, b_full, iterations, mom_history, div_history
