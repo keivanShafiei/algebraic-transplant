@@ -145,7 +145,7 @@ def main():
     checkpoint_path = os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'best.pt')
 
     # Generate node set
-    points = generate_cavity_nodes(N).to(device)
+    points = generate_cavity_points(N).to(device)
     print(f"INFO: Assembling solver (n={N}, Re={Re_test})")
 
     solver = NavierStokesSolver(points, k=25, eps=1e-8)
