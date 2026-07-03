@@ -33,6 +33,8 @@ Fixed from original:
   - HelmholtzProjectionLayer → HelmholtzProjection
   - solve_pcg(x0=...) → solve(Re, x0=...)
   - gradient_matrix → G_int
+  - generate_lid_cavity_nodes → generate_cavity_points
+  - build_graph (non-existent) → manual edge_index construction from stencils
   - numpy arrays → torch tensors throughout
   - Added x0 support to solver.solve() for warm-start
 """
@@ -57,10 +59,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 try:
     from src.rbf_fd.solver import NavierStokesSolver
+    from src.rbf_fd.stencils import build_stencils
     from src.gnn.neural_operator import NeuralOperator
     from src.projection.layer import HelmholtzProjection
-    from src.data.cavity import generate_lid_cavity_nodes
-    from src.gnn.message_passing import build_graph
+    from src.data.cavity import generate_cavity_points
 except ImportError as e:
     logger.error(f"Cannot import required module: {e}")
     logger.error("Make sure you are running from the repo root or scripts/ directory.")
@@ -80,6 +82,28 @@ CHECKPOINT = REPO_ROOT / 'checkpoints' / 'best.pt'
 PAPER_ITER_COLD = 500
 PAPER_ITER_SURROGATE = 120
 PAPER_SPEEDUP = 4.2
+
+
+def build_edge_index_from_stencils(stencils: torch.Tensor) -> torch.Tensor:
+    """Convert stencil matrix (N, k) to edge_index format (2, E).
+
+    Parameters
+    ----------
+    stencils : torch.Tensor
+        Stencil indices, shape (N, k) where stencils[i, j] is the j-th
+        nearest neighbor of node i.
+
+    Returns
+    -------
+    torch.Tensor
+        Edge connectivity, shape (2, E) where edge_index[0] = dst (target),
+        edge_index[1] = src (source).
+    """
+    N, k = stencils.shape
+    # Each node i connects to its k neighbors
+    dst = torch.arange(N, device=stencils.device).repeat_interleave(k)
+    src = stencils.flatten()
+    return torch.stack([dst, src], dim=0)  # (2, N*k)
 
 
 def run_solver(
@@ -263,7 +287,8 @@ def generate_surrogate_prediction(
         Projected velocity prediction, shape (2N,).
     """
     # Build graph from solver nodes
-    edge_index, edge_attr = build_graph(solver.points, k=STENCIL_K)
+    stencils = build_stencils(solver.points, k=STENCIL_K)
+    edge_index = build_edge_index_from_stencils(stencils)
 
     # Predict
     mu = torch.tensor([Re], dtype=torch.float32, device=solver.device)
@@ -272,7 +297,6 @@ def generate_surrogate_prediction(
             pos=solver.points,
             edge_index=edge_index,
             mu=mu,
-            edge_attr=edge_attr,
             edge_scale=1.0,
         )
 
@@ -293,7 +317,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
 
-    points = generate_lid_cavity_nodes(N=N).to(device)
+    points = generate_cavity_points(N=N).to(device)
     solver = NavierStokesSolver(points=points, k=STENCIL_K, eps=1e-8)
 
     G_int = solver.G_int  # Interior-restricted divergence operator
