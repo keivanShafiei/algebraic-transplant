@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.rbf_fd.solver import NavierStokesSolver
-from src.data.cavity import generate_cavity_nodes
+from src.data.cavity import generate_cavity_points
 from src.gnn.neural_operator import NeuralOperator
 from src.projection.layer import HelmholtzProjection
 
