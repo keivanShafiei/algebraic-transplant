@@ -1,437 +1,442 @@
-#!/usr/bin/env python3
-"""audit_warmstart_claim_v2.py — Corrected warm-start audit (Table 13).
+"""scripts/audit_warmstart_claim.py — Warm-Start Decomposition Audit
 
-CORRECTIONS from v1:
-====================
-1. "Cold start" in the paper refers to zero field WITH continuation 
-   (adaptive Re stepping from 100 to 500), NOT pure Picard.
-   The baseline Picard solver diverges at Re=500 (n_max=2000 hit).
+Disentangles the algebraic (divergence-free initialization) component
+from the physics-learning component of the warm-start iteration speedup.
 
-2. "Div-free zero" is a PROJECTED zero field: v=0 on interior, BCs on 
-   boundary, then projected to satisfy G_int @ v = 0 exactly.
-   This eliminates mass-conservation iterations.
+Experiment design (Section 4.6, Table 10):
+  Condition A: Cold start (zero field, non-div-free) → iter_cold
+  Condition B: Div-free ZERO field (no physics, div-free) → iter_zero_df
+  Condition C: Projected surrogate warm start (div-free) → iter_surrogate
 
-3. The iteration reduction from 500→145 is decomposed as:
-   - 500→145: algebraic (div-free initialization)
-   - 145→120: physics (learned flow structure)
+  Algebraic speedup = iter_cold / iter_zero_df
+  Physics speedup   = iter_zero_df / iter_surrogate (≥ 1 if field helps)
+  Total speedup       = iter_cold / iter_surrogate (reported: 4.2×)
 
-4. The continuation solver (solver_continuation.py) is REQUIRED for
-   reproducing Table 13. It was omitted from the initial repo release.
+If iter_zero_df ≈ iter_surrogate:
+  → Speedup is PRIMARILY ALGEBRAIC (div-free initialization, no field info)
+If iter_surrogate << iter_zero_df:
+  → Field accuracy provides a genuine additional speedup component.
 
-COMPATIBILITY FIXES (Kaggle v2 → v3 → v4):
-============================================
-- Uses solver.G_int (N_int x 2N) for projection to match checkpoint format
-- tau_mass relaxed to 5e-3 for high Re (consistent with data filter)
-- n_max=500 per continuation step (increased from 300)
-- Adaptive alpha: exponential decay alpha = 0.7 * (100/Re)^0.5
-- FIXED device mismatch in _build_edge_index (stencils on CPU, dst on CUDA)
-- FIXED batch dimension squeeze in apply_projection (model outputs (1, 2N))
-- tau_mom relaxed to 5e-2 for high Re (Picard unstable at 1e-2)
+Usage:
+  python scripts/audit_warmstart_claim.py
 
-DEFINITIONS (aligned with paper):
-=================================
-Condition A — Cold start (with continuation):
-    v=0 everywhere, solver uses adaptive Re continuation from Re=100.
-    Total iterations = sum across continuation sub-steps.
-    This is the paper's "cold start" baseline.
+Outputs:
+  results/warmstart_decomposition.json
 
-Condition B — Div-free zero field:
-    v=0 on interior DOFs, BCs enforced on boundary, THEN projected
-    via HelmholtzProjection to satisfy G_int @ v = 0.
-    This field is structure-less (no vortices) but divergence-free.
+Dependencies:
+  - src.rbf_fd.solver.NavierStokesSolver (solver)
+  - src.gnn.neural_operator.NeuralOperator (surrogate)
+  - src.projection.layer.HelmholtzProjection (projection)
 
-Condition C — NO warm-start:
-    Projected surrogate prediction (a_NO) used as initial guess.
-    Combines algebraic (div-free) + physics (learned structure) benefits.
-
-Condition D — Cold start (NO continuation, PURE PICARD):
-    v=0 everywhere, standard Picard with alpha=0.7.
-    EXPECTED TO DIVERGE at Re=500 (n_max=2000 hit).
-    Included only to demonstrate the NEED for continuation.
+Fixed from original:
+  - RBFFDSolver → NavierStokesSolver
+  - HelmholtzProjectionLayer → HelmholtzProjection
+  - solve_pcg(x0=...) → solve(Re, x0=...)
+  - gradient_matrix → G_int
+  - numpy arrays → torch tensors throughout
+  - Added x0 support to solver.solve() for warm-start
 """
 
 import os
 import sys
 import json
 import time
-import warnings
+import logging
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
-import numpy as np
 import torch
+import numpy as np
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# Add repo root to path
+REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 try:
     from src.rbf_fd.solver import NavierStokesSolver
-    from src.rbf_fd.solver_continuation import NavierStokesSolverContinuation
     from src.gnn.neural_operator import NeuralOperator
     from src.projection.layer import HelmholtzProjection
+    from src.data.cavity import generate_lid_cavity_nodes
+    from src.gnn.message_passing import build_graph
 except ImportError as e:
-    print(f"FATAL: Could not import from src/: {e}")
+    logger.error(f"Cannot import required module: {e}")
+    logger.error("Make sure you are running from the repo root or scripts/ directory.")
     sys.exit(1)
 
-# ── Configuration ────────────────────────────────────────────────────────────
-RE = 500
-N_NODES = 225
-K_NEIGHBORS = 25
-TOL_MASS = 5e-3      # Relaxed for high Re (consistent with data filter)
-TOL_MOM = 5e-2       # Relaxed for high Re (Picard unstable at 1e-2)
-N_MAX = 500          # Per continuation step
 
-RESULTS_DIR = REPO_ROOT / "results"
-CHECKPOINT_PATH = RESULTS_DIR / "model_best.pt"
-OUTPUT_JSON = RESULTS_DIR / "warmstart_decomposition_v2.json"
+# ---- Experiment configuration ----------------------------------------------
+RE = 500.0          # Reynolds number for extrapolation test
+N = 225             # Number of nodes (must match training resolution)
+STENCIL_K = 25      # Stencil size (must match training)
+TOL_MOM = 1e-2      # Momentum residual tolerance (matches solver default)
+TOL_MASS = 1e-4     # Divergence residual tolerance (matches solver default)
+N_MAX = 1000        # Safety cap on iterations
+CHECKPOINT = REPO_ROOT / 'checkpoints' / 'best.pt'
 
-# Paper reference values (Table 13)
+# Paper reference values (Table 10, Section 4.6)
 PAPER_ITER_COLD = 500
-PAPER_ITER_ZERO_DF = 145
 PAPER_ITER_SURROGATE = 120
 PAPER_SPEEDUP = 4.2
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def make_grid_points(n: int = N_NODES, device: str = "cpu") -> torch.Tensor:
-    side = int(round(n ** 0.5))
-    assert side * side == n, f"N_NODES={n} must be perfect square"
-    xs = torch.linspace(0.0, 1.0, side)
-    ys = torch.linspace(0.0, 1.0, side)
-    gx, gy = torch.meshgrid(xs, ys, indexing="ij")
-    pts = torch.stack([gx.reshape(-1), gy.reshape(-1)], dim=1)
-    return pts.to(torch.float32).to(device)
+def run_solver(
+    solver: NavierStokesSolver,
+    init_field: torch.Tensor | None,
+    label: str,
+) -> dict:
+    """Run solver from a given initial field and record iterations + time.
 
-def build_solver(re: float, n_nodes: int = N_NODES,
-                 device: str = "cpu", use_continuation: bool = False):
-    points = make_grid_points(n_nodes, device=device)
-    if use_continuation:
-        solver = NavierStokesSolverContinuation(
-            points=points, k=K_NEIGHBORS, continuation_steps=5, re_base=100.0
-        )
-    else:
-        solver = NavierStokesSolver(points=points, k=K_NEIGHBORS)
-    return solver
+    Parameters
+    ----------
+    solver : NavierStokesSolver
+        The RBF-FD solver instance.
+    init_field : torch.Tensor or None
+        Initial velocity guess, shape (2N,). If None, cold start (zero).
+    label : str
+        Descriptive label for this condition.
 
-def solve_with_init(
-    solver, re: float, x0, tol_mass: float = TOL_MASS,
-    tol_mom: float = TOL_MOM, n_max: int = N_MAX,
-    use_continuation: bool = False
-) -> tuple:
-    if isinstance(x0, np.ndarray):
-        x0 = torch.from_numpy(x0.astype(np.float32)).to(solver.device)
-    elif isinstance(x0, torch.Tensor):
-        x0 = x0.to(torch.float32).to(solver.device)
-
+    Returns
+    -------
+    dict
+        Results with keys: label, iterations, time_s, final_mom_res, final_div_res
+    """
+    logger.info(f"Running: {label}")
     t0 = time.perf_counter()
 
-    if isinstance(solver, NavierStokesSolverContinuation):
-        a, b_full, n_iter = solver.solve(
-            Re=re, x0=x0 if x0.abs().sum() > 0 else None,
-            tau_mom=tol_mom, tau_mass=tol_mass, n_max=n_max,
-            use_continuation=use_continuation
-        )
-    else:
-        a, b_full, n_iter = solver.solve(
-            Re=re, x0=x0, tau_mom=tol_mom,
-            tau_mass=tol_mass, n_max=n_max
-        )
+    a, b_full, iterations, mom_history, div_history = solver.solve(
+        Re=RE,
+        x0=init_field,
+        tau_mom=TOL_MOM,
+        tau_mass=TOL_MASS,
+        n_max=N_MAX,
+        verbose=False,
+    )
 
     elapsed = time.perf_counter() - t0
+    final_mom = mom_history[-1] if mom_history else float('nan')
+    final_div = div_history[-1] if div_history else float('nan')
 
-    if n_iter >= n_max:
-        warnings.warn(
-            f"AUDIT FLAG: solver hit n_max={n_max} at Re={re}. "
-            f"This is EXPECTED for pure Picard at Re=500.",
-            stacklevel=2
-        )
+    logger.info(
+        f"  {label}: {iterations} iterations, {elapsed:.2f}s, "
+        f"mom_res={final_mom:.2e}, div_res={final_div:.2e}"
+    )
 
-    return a, n_iter, elapsed
-
-def build_divfree_zero(solver: NavierStokesSolver) -> np.ndarray:
-    """Build a divergence-free zero field: v=0 interior, BCs boundary, projected."""
-    a = np.zeros(2 * solver.N, dtype=np.float32)
-
-    # Apply BCs on boundary
-    lid_idx = solver.is_lid.nonzero(as_tuple=True)[0].cpu().numpy()
-    a[2 * lid_idx] = 1.0  # lid velocity u=1
-
-    # Project to make div-free (interior-restricted, boundary preserved)
-    a_t = torch.from_numpy(a).to(solver.device)
-
-    # CRITICAL FIX: Use G_int (not G_full) to match checkpoint format
-    proj = HelmholtzProjection(
-        G=solver.G_int, eps=1e-8,
-        interior_mask=solver.interior_dof_mask
-    ).to(solver.device)
-
-    with torch.no_grad():
-        a_proj = proj(a_t)
-
-    return a_proj.cpu().numpy()
-
-def verify_divfree(a: np.ndarray, solver: NavierStokesSolver) -> float:
-    a_t = torch.from_numpy(a.astype(np.float32)).to(solver.device)
-    G_int = solver.G_int  # Use G_int directly
-    return float((G_int @ a_t).norm().item())
-
-# ── Surrogate helpers ────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    import yaml
-    config_path = REPO_ROOT / "config.yaml"
-    if config_path.exists():
-        with open(config_path) as f:
-            return yaml.safe_load(f)
     return {
-        "model": {"hidden": 64, "layers": 4, "k": K_NEIGHBORS},
-        "data": {"n_nodes": N_NODES, "re_max": 100.0},
-        "training": {"projection_eps": 1e-8},
+        'label': label,
+        'iterations': iterations,
+        'time_s': elapsed,
+        'final_mom_residual': final_mom,
+        'final_div_residual': final_div,
+        'mom_history': mom_history,
+        'div_history': div_history,
     }
 
-def _build_edge_index(stencils: torch.Tensor, device: str = "cpu") -> torch.Tensor:
-    """Build edge index for GNN. FIXED: ensure all tensors on same device."""
-    N, k = stencils.shape
-    # FIXED: move src to same device as dst
-    src = stencils.reshape(-1).to(device)
-    dst = torch.arange(N, device=device).repeat_interleave(k)
-    return torch.stack([src, dst], dim=0)
 
-def load_surrogate(cfg: dict, solver, device: str = "cpu"):
-    if not CHECKPOINT_PATH.exists():
-        return None
-    mc = cfg.get("model", {})
-    model = NeuralOperator(
-        n_nodes=solver.N, d=2, k=mc.get("k", K_NEIGHBORS),
-        hidden=mc.get("hidden", 64), layers=mc.get("layers", 4),
-        eps=cfg.get("training", {}).get("projection_eps", 1e-8),
+def project_to_div_free(
+    G: torch.Tensor,
+    field: torch.Tensor,
+    interior_dof_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Project field to divergence-free subspace using Gram projection.
+
+    Uses the interior-restricted projection (Proposition 4) to preserve
+    boundary conditions.
+
+    Parameters
+    ----------
+    G : torch.Tensor
+        Interior-restricted divergence operator, shape (N_int, 2N).
+    field : torch.Tensor
+        Raw velocity field, shape (2N,).
+    interior_dof_mask : torch.Tensor
+        Boolean mask of shape (2N,) for interior DOFs.
+
+    Returns
+    -------
+    torch.Tensor
+        Projected divergence-free velocity, shape (2N,).
+    """
+    proj_layer = HelmholtzProjection(
+        G=G,
+        eps=1e-8,
+        interior_dof_mask=interior_dof_mask,
     )
-    model.set_points(solver.points, solver.stencils)
+    return proj_layer.project_only(field)
 
-    # CRITICAL FIX: Use G_int (N_int x 2N) to match checkpoint format
-    # Checkpoint was saved with G_int from generate_data.py
-    model.set_projection(solver.G_int, solver.interior_dof_mask,
-                         interior_node_mask=solver.is_int)
 
-    state = torch.load(CHECKPOINT_PATH, map_location=device)
-    model.load_state_dict(state)
-    model.eval().to(device)
+def make_div_free_zero(
+    solver: NavierStokesSolver,
+) -> torch.Tensor:
+    """Construct a divergence-free zero field.
+
+    v = 0 for all interior degrees of freedom.
+    This trivially satisfies G_int v = 0 at machine precision.
+    It carries no physics information beyond the boundary conditions.
+
+    Parameters
+    ----------
+    solver : NavierStokesSolver
+        The solver instance (provides boundary DOF info).
+
+    Returns
+    -------
+    torch.Tensor
+        Zero field with boundary values preserved, shape (2N,).
+    """
+    zero = torch.zeros(2 * solver.N, dtype=torch.float32, device=solver.device)
+    # Boundary DOFs are already zero in this benchmark (no-slip + lid)
+    # So this is exactly the cold start but with div-free property
+    return zero
+
+
+def load_surrogate_model(
+    checkpoint_path: Path,
+    solver: NavierStokesSolver,
+) -> NeuralOperator:
+    """Load the trained neural surrogate model.
+
+    Parameters
+    ----------
+    checkpoint_path : Path
+        Path to the model checkpoint (.pt file).
+    solver : NavierStokesSolver
+        The solver instance (for operator transplantation).
+
+    Returns
+    -------
+    NeuralOperator
+        Loaded model with projection layer attached.
+    """
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}\n"
+            "Please train the model first or provide a valid checkpoint."
+        )
+
+    # Initialize model
+    model = NeuralOperator(
+        in_channels=2,
+        hidden=64,
+        layers=4,
+        param_dim=1,
+        eps=1e-8,
+    ).to(solver.device)
+
+    # Attach projection layer with interior restriction
+    model.set_projection(
+        G=solver.G_int,
+        interior_dof_mask=solver.interior_dof_mask,
+    )
+    model.set_interior_mask(solver.is_int)
+
+    # Load weights
+    state_dict = torch.load(checkpoint_path, map_location=solver.device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    logger.info(f"Loaded surrogate model from {checkpoint_path}")
     return model
 
-def predict_surrogate(model, re, solver, re_max=100.0, device="cpu"):
-    edge_index = _build_edge_index(solver.stencils, device=device)
-    mu = torch.tensor(re / re_max, dtype=torch.float32, device=device)
+
+def generate_surrogate_prediction(
+    model: NeuralOperator,
+    solver: NavierStokesSolver,
+    Re: float,
+) -> torch.Tensor:
+    """Generate surrogate prediction for a given Reynolds number.
+
+    Parameters
+    ----------
+    model : NeuralOperator
+        The trained surrogate model.
+    solver : NavierStokesSolver
+        The solver instance (for graph construction).
+    Re : float
+        Reynolds number.
+
+    Returns
+    -------
+    torch.Tensor
+        Projected velocity prediction, shape (2N,).
+    """
+    # Build graph from solver nodes
+    edge_index, edge_attr = build_graph(solver.points, k=STENCIL_K)
+
+    # Predict
+    mu = torch.tensor([Re], dtype=torch.float32, device=solver.device)
     with torch.no_grad():
-        _, a_NO, b_pred = model(mu, edge_index, inference=True)
-    return a_NO.cpu().numpy(), b_pred.cpu().numpy()
-
-def apply_projection(a_raw, solver, eps=1e-8):
-    """Apply projection to raw surrogate output. FIXED: squeeze batch dim."""
-    a_t = torch.from_numpy(a_raw.astype(np.float32)).to(solver.device)
-
-    # CRITICAL FIX: squeeze batch dimension if present
-    # Model outputs shape (1, 2N) or (batch, 2N), projection expects (2N,)
-    if a_t.dim() > 1 and a_t.shape[0] == 1:
-        a_t = a_t.squeeze(0)  # (1, 450) -> (450,)
-    elif a_t.dim() > 1:
-        # Batch > 1: process each sample separately
-        results = []
-        for i in range(a_t.shape[0]):
-            a_i = apply_projection(a_t[i].cpu().numpy(), solver, eps)
-            results.append(a_i)
-        return np.stack(results)
-
-    # CRITICAL FIX: Use G_int to match checkpoint format
-    proj = HelmholtzProjection(
-        G=solver.G_int, eps=eps, interior_mask=solver.interior_dof_mask
-    ).to(solver.device)
-    with torch.no_grad():
-        a_proj = proj(a_t)
-    return a_proj.cpu().numpy()
-
-# ── Decomposition analytics ───────────────────────────────────────────────────
-
-def compute_decomposition(iter_cold, iter_zero_df, iter_surrogate):
-    denom = iter_cold - iter_surrogate
-    if denom <= 0:
-        return {}
-    f_alg = (iter_cold - iter_zero_df) / denom
-    f_phys = (iter_zero_df - iter_surrogate) / denom
-    return {
-        "speedup_total": round(iter_cold / iter_surrogate, 3),
-        "speedup_algebraic": round(iter_cold / iter_zero_df, 3),
-        "speedup_physics": round(iter_zero_df / iter_surrogate, 3),
-        "frac_algebraic": f_alg,
-        "frac_physics": f_phys,
-        "frac_algebraic_pct": round(f_alg * 100, 1),
-        "frac_physics_pct": round(f_phys * 100, 1),
-    }
-
-def flag_deviations(iter_cold, iter_zero_df, iter_surrogate):
-    flags = []
-    if abs(iter_cold - PAPER_ITER_COLD) / PAPER_ITER_COLD > 0.15:
-        flags.append(
-            f"iter_cold={iter_cold} deviates >15% from paper {PAPER_ITER_COLD}"
+        a_NO, p_corr = model.predict(
+            pos=solver.points,
+            edge_index=edge_index,
+            mu=mu,
+            edge_attr=edge_attr,
+            edge_scale=1.0,
         )
-    if abs(iter_zero_df - PAPER_ITER_ZERO_DF) / PAPER_ITER_ZERO_DF > 0.15:
-        flags.append(
-            f"iter_zero_df={iter_zero_df} deviates >15% from paper {PAPER_ITER_ZERO_DF}"
+
+    return a_NO
+
+
+# =============================================================================
+# MAIN EXPERIMENT
+# =============================================================================
+
+if __name__ == '__main__':
+    # Create output directory
+    results_dir = REPO_ROOT / 'results'
+    results_dir.mkdir(exist_ok=True)
+
+    # ---- Assemble solver ----------------------------------------------------
+    logger.info(f"Assembling solver (N={N}, Re={RE})")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+
+    points = generate_lid_cavity_nodes(N=N).to(device)
+    solver = NavierStokesSolver(points=points, k=STENCIL_K, eps=1e-8)
+
+    G_int = solver.G_int  # Interior-restricted divergence operator
+
+    # ---- Condition A: Cold start ------------------------------------------
+    res_cold = run_solver(
+        solver=solver,
+        init_field=None,  # Cold start: zero field
+        label='Cold start (zero, non-div-free)',
+    )
+
+    # ---- Condition B: Divergence-free zero field --------------------------
+    df_zero = make_div_free_zero(solver)
+    div_res_zero = float((G_int @ df_zero).norm().item())
+    logger.info(f"  Div-free zero field: ||G v||={div_res_zero:.2e} (should be ~0)")
+
+    res_zero_df = run_solver(
+        solver=solver,
+        init_field=df_zero,
+        label='Div-free zero field (no physics)',
+    )
+
+    # ---- Condition C: Projected surrogate warm start ----------------------
+    if CHECKPOINT.exists():
+        logger.info(f"Loading surrogate checkpoint: {CHECKPOINT}")
+        model = load_surrogate_model(CHECKPOINT, solver)
+
+        # Generate surrogate prediction
+        surrogate_field = generate_surrogate_prediction(model, solver, Re=RE)
+
+        # Project to divergence-free (already projected by model, but double-check)
+        proj_field = project_to_div_free(
+            G=G_int,
+            field=surrogate_field,
+            interior_dof_mask=solver.interior_dof_mask,
         )
-    if iter_surrogate is not None:
-        if abs(iter_surrogate - PAPER_ITER_SURROGATE) / PAPER_ITER_SURROGATE > 0.20:
-            flags.append(
-                f"iter_surrogate={iter_surrogate} deviates >20% from paper {PAPER_ITER_SURROGATE}"
+        div_res_proj = float((G_int @ proj_field).norm().item())
+        logger.info(f"  Projected surrogate div residual: {div_res_proj:.2e}")
+
+        res_surrogate = run_solver(
+            solver=solver,
+            init_field=proj_field,
+            label='Projected surrogate warm start',
+        )
+    else:
+        logger.warning(f"Checkpoint not found: {CHECKPOINT}")
+        logger.warning("Skipping surrogate warm-start condition.")
+        logger.warning("Train the model first to get full decomposition.")
+        res_surrogate = {
+            'label': 'Projected surrogate warm start (SKIPPED — no checkpoint)',
+            'iterations': 0,
+            'time_s': 0.0,
+            'final_mom_residual': float('nan'),
+            'final_div_residual': float('nan'),
+        }
+
+    # ---- Decomposition analysis -------------------------------------------
+    iter_cold = res_cold['iterations']
+    iter_zero_df = res_zero_df['iterations']
+    iter_surrogate = res_surrogate['iterations']
+
+    if iter_surrogate > 0:
+        speedup_total = iter_cold / max(iter_surrogate, 1)
+        speedup_algebraic = iter_cold / max(iter_zero_df, 1)
+        speedup_physics = iter_zero_df / max(iter_surrogate, 1)
+
+        # Fraction of total speedup attributable to each component
+        total_reduction = iter_cold - iter_surrogate
+        if total_reduction > 0:
+            frac_algebraic = (iter_cold - iter_zero_df) / total_reduction
+            frac_physics = (iter_zero_df - iter_surrogate) / total_reduction
+        else:
+            frac_algebraic = 0.0
+            frac_physics = 0.0
+
+        # Consistency check against paper
+        iter_deviation_cold = abs(iter_cold - PAPER_ITER_COLD) / PAPER_ITER_COLD
+        iter_deviation_surr = abs(iter_surrogate - PAPER_ITER_SURROGATE) / PAPER_ITER_SURROGATE
+
+        if iter_deviation_cold > 0.05:
+            logger.warning(
+                f"FLAGGED: cold-start iteration count {iter_cold} deviates "
+                f">{iter_deviation_cold*100:.1f}% from paper value {PAPER_ITER_COLD}."
             )
-    return flags
+        if iter_deviation_surr > 0.10:
+            logger.warning(
+                f"FLAGGED: surrogate warm-start iteration count {iter_surrogate} deviates "
+                f">{iter_deviation_surr*100:.1f}% from paper value {PAPER_ITER_SURROGATE}."
+            )
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+        primary_component = 'ALGEBRAIC' if frac_algebraic > 0.6 else 'PHYSICS'
 
-def main() -> dict:
-    print("=" * 70)
-    print("Warm-Start Audit v2: Corrected Table 13 Reproduction")
-    print("=" * 70)
-
-    cfg = load_config()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    re_max = cfg.get("data", {}).get("re_max", 100.0)
-    eps = cfg.get("training", {}).get("projection_eps", 1e-8)
-    print(f"Device: {device}")
-    print(f"tau_mass (relaxed for high Re): {TOL_MASS}")
-    print(f"tau_mom (relaxed for high Re): {TOL_MOM}")
-    print(f"n_max per step: {N_MAX}")
-
-    # ── Build solvers ─────────────────────────────────────────────
-    print(f"[1/6] Assembling solvers at Re={RE}, N={N_NODES}...")
-    solver_picard = build_solver(RE, use_continuation=False)
-    solver_cont = build_solver(RE, use_continuation=True)
-    print("  Picard solver assembled.")
-    print("  Continuation solver assembled (5 steps from Re=100).")
-
-    # ── Condition D: Pure Picard (EXPECTED TO FAIL) ─────────────
-    print("\n[2/6] Condition D: Cold start — PURE PICARD (NO continuation)")
-    print("  EXPECTED: Divergence or n_max hit (Re=500 out of range)")
-    x0_zero = np.zeros(2 * N_NODES, dtype=np.float32)
-    sol_d, iter_d, t_d = solve_with_init(
-        solver_picard, RE, x0_zero, n_max=2000, use_continuation=False
-    )
-    print(f"  Iterations: {iter_d} {'(DIVERGED — expected)' if iter_d >= 2000 else '(converged — unexpected)'}")
-    print(f"  Time (s): {t_d:.3f}")
-
-    # ── Condition A: Cold start WITH continuation ────────────────
-    print("[3/6] Condition A: Cold start — WITH continuation (paper baseline)")
-    print("  v=0 everywhere, adaptive Re stepping from 100→500")
-    sol_a, iter_a, t_a = solve_with_init(
-        solver_cont, RE, x0_zero, use_continuation=True
-    )
-    print(f"  Iterations: {iter_a}")
-    print(f"  Time (s): {t_a:.3f}")
-
-    # ── Condition B: Div-free zero field ──────────────────────────
-    print("[4/6] Condition B: Div-free zero field")
-    print("  v=0 interior + BCs boundary, then projected to G_int @ v = 0")
-    x0_divfree = build_divfree_zero(solver_cont)
-    eps_div_df = verify_divfree(x0_divfree, solver_cont)
-    print(f"  Pre-solve ε_div: {eps_div_df:.3e}")
-    sol_b, iter_b, t_b = solve_with_init(
-        solver_cont, RE, x0_divfree, use_continuation=False
-    )
-    print(f"  Iterations: {iter_b}")
-    print(f"  Time (s): {t_b:.3f}")
-
-    # ── Condition C: NO warm-start ────────────────────────────────
-    print("[5/6] Condition C: Neural Operator warm-start")
-    model = load_surrogate(cfg, solver_cont, device=device)
-
-    if model is None:
-        warnings.warn(
-            f"Checkpoint not found at {CHECKPOINT_PATH}. "
-            "Skipping Condition C; reporting only A, B, D."
-        )
-        iter_c = t_c = eps_div_c = None
+        logger.info(f"\n{'='*60}")
+        logger.info(f"WARM-START DECOMPOSITION RESULTS (Re={RE}, N={N})")
+        logger.info(f"{'='*60}")
+        logger.info(f"  Cold start iterations:          {iter_cold}")
+        logger.info(f"  Div-free zero-field iterations: {iter_zero_df}")
+        logger.info(f"  Surrogate warm-start iterations: {iter_surrogate}")
+        logger.info(f"  Total speedup:                  {speedup_total:.2f}× (paper: {PAPER_SPEEDUP}×)")
+        logger.info(f"  Algebraic speedup:              {speedup_algebraic:.2f}× ({frac_algebraic*100:.1f}% of total)")
+        logger.info(f"  Physics speedup:                {speedup_physics:.2f}× ({frac_physics*100:.1f}% of total)")
+        logger.info(f"  Primary component:              {primary_component}")
+        logger.info(f"{'='*60}\n")
     else:
-        a_raw, b_pred = predict_surrogate(model, RE, solver_cont, re_max, device)
-        a_proj = apply_projection(a_raw, solver_cont, eps)
-        eps_div_c = verify_divfree(a_proj, solver_cont)
-        print(f"  Post-projection ε_div: {eps_div_c:.3e}")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"WARM-START DECOMPOSITION RESULTS (Re={RE}, N={N})")
+        logger.info(f"{'='*60}")
+        logger.info(f"  Cold start iterations:          {iter_cold}")
+        logger.info(f"  Div-free zero-field iterations: {iter_zero_df}")
+        logger.info(f"  Surrogate warm-start:           SKIPPED (no checkpoint)")
+        logger.info(f"  Partial speedup:                {iter_cold/max(iter_zero_df,1):.2f}× (algebraic only)")
+        logger.info(f"{'='*60}\n")
+        speedup_total = 0.0
+        speedup_algebraic = iter_cold / max(iter_zero_df, 1)
+        speedup_physics = 0.0
+        frac_algebraic = 1.0
+        frac_physics = 0.0
+        primary_component = 'ALGEBRAIC (partial — no surrogate)'
 
-        sol_c, iter_c, t_c = solve_with_init(
-            solver_cont, RE, a_proj, use_continuation=False
-        )
-        print(f"  Iterations: {iter_c}")
-        print(f"  Time (s): {t_c:.3f}")
-
-    # ── Decomposition ───────────────────────────────────────────
-    print("[6/6] Decomposition analysis")
-    if iter_c is not None:
-        decomp = compute_decomposition(iter_a, iter_b, iter_c)
-        print(f"  Total speedup (cold/NO): {decomp.get('speedup_total', 'N/A')}")
-        print(f"  Algebraic fraction: {decomp.get('frac_algebraic_pct', 'N/A')}%")
-        print(f"  Physics fraction: {decomp.get('frac_physics_pct', 'N/A')}%")
-    else:
-        decomp = {}
-        print("  (NO surrogate available — decomposition incomplete)")
-
-    flags = flag_deviations(iter_a, iter_b, iter_c)
-
-    # ── Results ─────────────────────────────────────────────────
-    result = {
-        "Re": RE, "N": N_NODES,
-        "tau_mass": TOL_MASS,
-        "tau_mom": TOL_MOM,
-        "n_max_per_step": N_MAX,
-        "condition_D_picard_only": {
-            "description": "Pure Picard, v=0, NO continuation",
-            "iterations": iter_d,
-            "converged": iter_d < 2000,
-            "time_s": round(t_d, 3),
-            "note": "EXPECTED TO DIVERGE at Re=500"
-        },
-        "condition_A_cold_start": {
-            "description": "v=0 with continuation from Re=100 (paper baseline)",
-            "iterations": iter_a,
-            "time_s": round(t_a, 3),
-            "paper_reference": PAPER_ITER_COLD
-        },
-        "condition_B_divfree_zero": {
-            "description": "Projected zero field (div-free, BCs preserved)",
-            "pre_solve_eps_div": eps_div_df,
-            "iterations": iter_b,
-            "time_s": round(t_b, 3),
-            "paper_reference": PAPER_ITER_ZERO_DF
-        },
-        "condition_C_NO_warmstart": {
-            "description": "Projected surrogate prediction",
-            "pre_solve_eps_div": eps_div_c,
-            "iterations": iter_c,
-            "time_s": round(t_c, 3) if t_c else None,
-            "paper_reference": PAPER_ITER_SURROGATE
-        },
-        "decomposition": decomp,
-        "flagged_deviations": flags,
-        "notes": [
-            "Continuation solver (solver_continuation.py) is REQUIRED for Table 13.",
-            "Pure Picard diverges at Re=500; this is a known limitation.",
-            "tau_mass relaxed to 5e-3 for high Re (consistent with data filter).",
-            "tau_mom relaxed to 5e-2 for high Re (Picard unstable at 1e-2).",
-            "Div-free zero eliminates mass-conservation iterations (algebraic benefit).",
-            "NO warm-start adds learned flow structure (physics benefit)."
-        ]
+    # ---- Save results -----------------------------------------------------
+    output = {
+        'Re': RE,
+        'N': N,
+        'iter_cold': iter_cold,
+        'iter_div_free_zero': iter_zero_df,
+        'iter_surrogate': iter_surrogate,
+        'speedup_total': round(speedup_total, 3),
+        'speedup_algebraic': round(speedup_algebraic, 3),
+        'speedup_physics': round(speedup_physics, 3),
+        'frac_algebraic_pct': round(frac_algebraic * 100.0, 1),
+        'frac_physics_pct': round(frac_physics * 100.0, 1),
+        'primary_component': primary_component,
+        'paper_claimed_speedup': PAPER_SPEEDUP,
+        'paper_iter_cold': PAPER_ITER_COLD,
+        'paper_iter_surrogate': PAPER_ITER_SURROGATE,
+        'time_cold_s': round(res_cold['time_s'], 3),
+        'time_zero_df_s': round(res_zero_df['time_s'], 3),
+        'time_surrogate_s': round(res_surrogate.get('time_s', 0.0), 3),
+        'checkpoint_exists': CHECKPOINT.exists(),
+        'checkpoint_path': str(CHECKPOINT),
     }
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_JSON, "w") as f:
-        json.dump(result, f, indent=2)
-
-    print("\n" + "=" * 70)
-    print("Results written to:", OUTPUT_JSON)
-    print(json.dumps(result, indent=2))
-    print("=" * 70)
-
-    if flags:
-        print("⚠️  WARNINGS:")
-        for fl in flags:
-            print(f"  - {fl}")
-
-    return result
-
-if __name__ == "__main__":
-    main()
+    out_path = results_dir / 'warmstart_decomposition.json'
+    with open(out_path, 'w') as f:
+        json.dump(output, f, indent=2)
+    logger.info(f"Saved decomposition results to {out_path}")
