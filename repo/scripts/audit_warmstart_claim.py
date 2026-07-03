@@ -1,323 +1,298 @@
-"""scripts/audit_warmstart_claim.py — Warm-Start Decomposition Audit
+#!/usr/bin/env python3
+"""audit_warmstart_claim.py — Reproduce Table 10 & Table 13 warm-start claims.
 
-Disentangles the algebraic (divergence-free initialization) component
-from the physics-learning component of the warm-start iteration speedup.
-
-EXPERIMENT DESIGN (Section 4.6, Table 10):
-  Condition A: Cold start (zero field, non-div-free) → iter_cold
-  Condition B: Div-free ZERO field (no physics, div-free) → iter_zero_df
-  Condition C: Projected surrogate warm start (div-free) → iter_surrogate
-
-IMPORTANT — Solver Configuration:
-  The paper's Table 10 uses a CONTINUATION SOLVER (adaptive Re stepping
-  from 100 to 500). This audit script uses PURE PICARD (direct solve at Re=500).
-
-  Per the paper's footnote (Section 4.6):
-    "Independent audit with scripts/audit_warmstart_claim.py (pure Picard, 
-    no continuation) reproduces the qualitative decomposition (100% algebraic 
-    contribution) but reports higher absolute iteration counts 
-    (cold: 3000, div-free: 500, NO: 500)."
-
-  Therefore:
-    - Qualitative finding (100% algebraic) is reproducible with pure Picard
-    - Quantitative numbers differ from Table 10 (which uses continuation)
-    - n_max should be set to 3000+ for pure Picard to match paper's audit numbers
+This script audits the paper's warm-start claims by:
+  1. Testing convergence at Re=100 (training range) with direct solver
+  2. Testing Re=500 with BOTH pure Picard and continuation solver
+  3. Testing warm-start with div-free zero field and GNN surrogate
+  4. Comparing against paper's reported values
 
 Usage:
-  python scripts/audit_warmstart_claim.py
-
-Outputs:
-  results/warmstart_decomposition.json
+    python scripts/audit_warmstart_claim.py
 """
 
-import os
 import sys
+import os
 import json
 import time
-import logging
-from pathlib import Path
-
 import torch
 import numpy as np
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+# Add repo root to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-REPO_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
-try:
-    from src.rbf_fd.solver import NavierStokesSolver
-    from src.rbf_fd.stencils import build_stencils
-    from src.gnn.neural_operator import NeuralOperator
-    from src.projection.layer import HelmholtzProjection
-    from src.data.cavity import generate_cavity_points
-except ImportError as e:
-    logger.error(f"Cannot import required module: {e}")
-    sys.exit(1)
+from src.rbf_fd.solver import NavierStokesSolver
+from src.data.cavity import generate_cavity_nodes
+from src.gnn.neural_operator import NeuralOperator
+from src.projection.layer import HelmholtzProjection
 
 
-# ---- Configuration ----------------------------------------------------------
-RE = 500.0          # Reynolds number for extrapolation test
-N_NODES = 225       # Number of nodes (must match training resolution)
-STENCIL_K = 25      # Stencil size (must match training)
-TOL_MOM = 1e-2      # Momentum residual tolerance
-TOL_MASS = 1e-4     # Divergence residual tolerance
-
-# CRITICAL: For pure Picard at Re=500 without continuation, n_max must be 
-# at least 3000 to match paper's audit numbers (footnote, Section 4.6).
-# The paper's Table 10 uses a continuation solver with lower iteration counts.
-N_MAX = 3000        # Increased from 1000 to match paper's pure Picard audit
-
-CHECKPOINT = REPO_ROOT / 'checkpoints' / 'best.pt'
-
-# Paper reference values
-PAPER_ITER_COLD = 500      # Table 10 (continuation solver)
-PAPER_ITER_SURROGATE = 120 # Table 10 (continuation solver)
-PAPER_SPEEDUP = 4.2        # Table 10 (continuation solver)
-
-# Paper footnote: pure Picard audit numbers
-PAPER_PICARD_COLD = 3000
-PAPER_PICARD_ZERO_DF = 500
-PAPER_PICARD_SURROGATE = 500
+def generate_div_free_zero(N, device):
+    """Generate a divergence-free zero field (all zeros)."""
+    return torch.zeros(2 * N, dtype=torch.float32, device=device)
 
 
-# ---- Helper functions -------------------------------------------------------
+def load_gnn_surrogate(checkpoint_path, solver, device):
+    """Load trained GNN and return a callable surrogate function."""
+    if not os.path.exists(checkpoint_path):
+        return None
+    try:
+        from src.gnn.neural_operator import NeuralOperator
+        model = NeuralOperator(
+            in_dim=2,
+            hidden_dim=128,
+            out_dim=2,
+            num_layers=6,
+            num_nodes=solver.N,
+        ).to(device)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
 
-def build_edge_index_from_stencils(stencils: torch.Tensor) -> torch.Tensor:
-    """Convert stencil matrix (N, k) to edge_index format (2, E)."""
-    N, k = stencils.shape
-    dst = torch.arange(N, device=stencils.device).repeat_interleave(k)
-    src = stencils.flatten()
-    return torch.stack([dst, src], dim=0)
+        # Transplant G_int into projection layer
+        model.set_projection(solver.G_int)
+
+        def surrogate_fn(Re):
+            mu = torch.tensor([[Re / 100.0]], dtype=torch.float32, device=device)
+            edge_index = torch.load(
+                os.path.join(os.path.dirname(checkpoint_path), '..', 'data', 'edge_index.pt')
+            ).to(device)
+            with torch.no_grad():
+                a_hat, a_no, b_pred = model(mu, edge_index)
+            return a_no.squeeze(0)  # shape (2N,)
+
+        return surrogate_fn
+    except Exception as e:
+        print(f"WARNING: Failed to load surrogate: {e}")
+        return None
 
 
-def run_solver(solver, init_field, label):
-    """Run solver from initial field and record iterations + time."""
-    logger.info(f"Running: {label}")
-    t0 = time.perf_counter()
-
-    a, b_full, iterations, mom_history, div_history = solver.solve(
-        Re=RE,
-        x0=init_field,
-        tau_mom=TOL_MOM,
-        tau_mass=TOL_MASS,
-        n_max=N_MAX,
-        verbose=False,
+def run_solver_direct(solver, Re, x0, label, n_max=100, verbose=False):
+    """Run direct Picard solver (for Re <= 100)."""
+    start = time.time()
+    a, b_full, iters, mom_hist, div_hist = solver.solve(
+        Re=Re,
+        x0=x0,
+        tau_mom=1e-2,
+        tau_mass=1e-4,
+        n_max=n_max,
+        use_iterative=True,
+        adaptive_relax=True,
+        verbose=verbose,
     )
+    elapsed = time.time() - start
+    converged = (mom_hist[-1] < 1e-2) and (div_hist[-1] < 1e-4) if mom_hist else False
+    status = "CONVERGED" if converged else "MAX_ITER" if iters >= n_max else "NOT_CONVERGED"
 
-    elapsed = time.perf_counter() - t0
-    final_mom = mom_history[-1] if mom_history else float('nan')
-    final_div = div_history[-1] if div_history else float('nan')
-    converged = final_mom < TOL_MOM and final_div < TOL_MASS
-
-    status = "CONVERGED" if converged else f"MAX_ITER (mom={final_mom:.2e})"
-    logger.info(
-        f"  {label}: {iterations} iters, {elapsed:.2f}s, {status}"
-    )
+    print(f"INFO:   {label}: {iters} iters, {elapsed:.2f}s, {status} (mom={mom_hist[-1]:.2e})")
 
     return {
-        'label': label,
-        'iterations': iterations,
-        'time_s': elapsed,
-        'final_mom_residual': final_mom,
-        'final_div_residual': final_div,
+        'a': a,
+        'b': b_full,
+        'iters': iters,
+        'mom_hist': mom_hist,
+        'div_hist': div_hist,
         'converged': converged,
+        'time_s': elapsed,
     }
 
 
-def project_to_div_free(G, field, interior_dof_mask):
-    """Project field to divergence-free subspace."""
-    proj_layer = HelmholtzProjection(
-        G=G, eps=1e-8, interior_dof_mask=interior_dof_mask,
+def run_solver_continuation(solver, Re_target, x0, label, n_max_per_step=100, verbose=False):
+    """Run continuation solver (for Re > 100)."""
+    start = time.time()
+    a, b_full, total_iters, mom_hist, div_hist = solver.solve_continuation(
+        Re_target=Re_target,
+        x0=x0,
+        tau_mom=1e-2,
+        tau_mass=1e-4,
+        n_max_per_step=n_max_per_step,
+        use_iterative=True,
+        adaptive_relax=True,
+        verbose=verbose,
     )
-    return proj_layer.project_only(field)
+    elapsed = time.time() - start
+    converged = (mom_hist[-1] < 1e-2) and (div_hist[-1] < 1e-4) if mom_hist else False
+    status = "CONVERGED" if converged else "NOT_CONVERGED"
+
+    print(f"INFO:   {label}: {total_iters} total iters, {elapsed:.2f}s, {status} (mom={mom_hist[-1]:.2e})")
+
+    return {
+        'a': a,
+        'b': b_full,
+        'iters': total_iters,
+        'mom_hist': mom_hist,
+        'div_hist': div_hist,
+        'converged': converged,
+        'time_s': elapsed,
+    }
 
 
-def make_div_free_zero(solver):
-    """Construct divergence-free zero field."""
-    return torch.zeros(2 * solver.N, dtype=torch.float32, device=solver.device)
+def print_history(label, mom_hist, div_hist, n_show=5):
+    """Pretty-print residual history."""
+    print(f"INFO:   Mom residual history (first {n_show}): {[f\'{v:.2e}\' for v in mom_hist[:n_show]]}")
+    print(f"INFO:   Mom residual history (last {n_show}):  {[f\'{v:.2e}\' for v in mom_hist[-n_show:]]}")
+    print(f"INFO:   Div residual history (first {n_show}): {[f\'{v:.2e}\' for v in div_hist[:n_show]]}")
+    print(f"INFO:   Div residual history (last {n_show}):  {[f\'{v:.2e}\' for v in div_hist[-n_show:]]}")
 
 
-def load_surrogate_model(checkpoint_path, solver):
-    """Load trained neural surrogate."""
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"INFO: Device: {device}")
 
-    model = NeuralOperator(
-        in_channels=2, hidden=64, layers=4, param_dim=1, eps=1e-8,
-    ).to(solver.device)
+    # Configuration
+    N = 225
+    Re_test = 500.0
+    checkpoint_path = os.path.join(os.path.dirname(__file__), '..', 'checkpoints', 'best.pt')
 
-    model.set_projection(
-        G=solver.G_int,
-        interior_dof_mask=solver.interior_dof_mask,
+    # Generate node set
+    points = generate_cavity_nodes(N).to(device)
+    print(f"INFO: Assembling solver (n={N}, Re={Re_test})")
+
+    solver = NavierStokesSolver(points, k=25, eps=1e-8)
+
+    # ============================================================
+    # TEST 1: Re=100 (within training range) — direct solver
+    # ============================================================
+    print("\n############################################################")
+    print("INFO: # TEST 1: Re=100 (within training range)")
+    print("INFO: ############################################################")
+
+    res_cold_100 = run_solver_direct(solver, 100.0, None, "Cold start (Re=100)", n_max=100)
+    print_history("Cold start (Re=100)", res_cold_100['mom_hist'], res_cold_100['div_hist'])
+
+    div_free_100 = generate_div_free_zero(N, device)
+    res_df_100 = run_solver_direct(solver, 100.0, div_free_100, "Div-free zero (Re=100)", n_max=100)
+    print_history("Div-free zero (Re=100)", res_df_100['mom_hist'], res_df_100['div_hist'])
+
+    # ============================================================
+    # TEST 2: Re=500 (extrapolation) — continuation solver
+    # ============================================================
+    print("\n############################################################")
+    print("INFO: # TEST 2: Re=500 (extrapolation)")
+    print("INFO: ############################################################")
+    print("INFO: Using continuation solver (Re=10→20→50→100→200→300→400→500)")
+    print("INFO: Paper's Table 10 reports iteration counts with continuation.")
+
+    # Cold start with continuation
+    res_cold_500 = run_solver_continuation(
+        solver, 500.0, None, "Cold start continuation (Re=500)", n_max_per_step=100
     )
-    model.set_interior_mask(solver.is_int)
+    print_history("Cold start cont.", res_cold_500['mom_hist'], res_cold_500['div_hist'])
 
-    state_dict = torch.load(checkpoint_path, map_location=solver.device, weights_only=True)
-    model.load_state_dict(state_dict)
-    model.eval()
+    # Div-free zero with continuation
+    div_free_500 = generate_div_free_zero(N, device)
+    res_df_500 = run_solver_continuation(
+        solver, 500.0, div_free_500, "Div-free zero continuation (Re=500)", n_max_per_step=100
+    )
+    print_history("Div-free zero cont.", res_df_500['mom_hist'], res_df_500['div_hist'])
 
-    logger.info(f"Loaded model from {checkpoint_path}")
-    return model
+    # GNN surrogate with continuation
+    surrogate_fn = load_gnn_surrogate(checkpoint_path, solver, device)
+    if surrogate_fn is not None:
+        a_no = surrogate_fn(Re_test)
+        # Verify div-free property
+        div_no = (solver.G_int @ a_no).norm().item()
+        print(f"INFO:   GNN surrogate ||G_int a_NO|| = {div_no:.2e}")
 
-
-def generate_surrogate_prediction(model, solver, Re):
-    """Generate surrogate prediction."""
-    stencils = build_stencils(solver.points, k=STENCIL_K)
-    edge_index = build_edge_index_from_stencils(stencils)
-
-    mu = torch.tensor([Re], dtype=torch.float32, device=solver.device)
-    with torch.no_grad():
-        a_NO, p_corr = model.predict(
-            pos=solver.points,
-            edge_index=edge_index,
-            mu=mu,
-            edge_scale=1.0,
+        res_surrogate_500 = run_solver_continuation(
+            solver, 500.0, a_no, "Surrogate continuation (Re=500)", n_max_per_step=100
         )
-    return a_NO
+        print_history("Surrogate cont.", res_surrogate_500['mom_hist'], res_surrogate_500['div_hist'])
+    else:
+        print("INFO: WARNING: No GNN checkpoint found. Skipping surrogate test.")
+        res_surrogate_500 = None
 
+    # ============================================================
+    # TEST 3: Pure Picard comparison (for reference)
+    # ============================================================
+    print("\n############################################################")
+    print("INFO: # TEST 3: Pure Picard at Re=500 (paper footnote)")
+    print("INFO: ############################################################")
+    print("INFO: Paper footnote: pure Picard cold=3000, zero-df=500, surrogate=500")
 
-# =============================================================================
-# MAIN
-# =============================================================================
+    res_picard_cold = run_solver_direct(
+        solver, 500.0, None, "Pure Picard cold (Re=500)", n_max=3000
+    )
+    print_history("Pure Picard cold", res_picard_cold['mom_hist'], res_picard_cold['div_hist'])
+
+    # ============================================================
+    # TEST 4: Div-free property verification
+    # ============================================================
+    print("\n############################################################")
+    print("INFO: # TEST 4: Verify div-free property")
+    print("INFO: ############################################################")
+    zero_field = torch.zeros(2 * N, device=device)
+    div_zero = (solver.G_int @ zero_field).norm().item()
+    print(f"INFO:   Zero field div residual: {div_zero:.2e}")
+    print(f"INFO:   Expected: ~0 (zero field is trivially div-free)")
+
+    # ============================================================
+    # SUMMARY
+    # ============================================================
+    print("\n======================================================================")
+    print("INFO: WARM-START AUDIT SUMMARY")
+    print("INFO: ==================================================================")
+
+    # Re=100 results
+    print(f"INFO: [Re=100] Cold start:      {res_cold_100['iters']} iters, converged={res_cold_100['converged']}")
+    print(f"INFO: [Re=100] Div-free zero:   {res_df_100['iters']} iters, converged={res_df_100['converged']}")
+
+    # Re=500 continuation results
+    print(f"INFO: [Re=500] Cont. cold:      {res_cold_500['iters']} iters, converged={res_cold_500['converged']}")
+    print(f"INFO: [Re=500] Cont. zero-df:   {res_df_500['iters']} iters, converged={res_df_500['converged']}")
+    if res_surrogate_500:
+        print(f"INFO: [Re=500] Cont. surrogate: {res_surrogate_500['iters']} iters, converged={res_surrogate_500['converged']}")
+
+        # Speedup calculation
+        speedup = res_cold_500['iters'] / max(1, res_surrogate_500['iters'])
+        print(f"INFO: [Re=500] Speedup (cold/surrogate): {speedup:.2f}×")
+        print(f"INFO: Paper claim: 4.2×")
+
+    # Pure Picard comparison
+    print(f"INFO: [Re=500] Pure Picard cold: {res_picard_cold['iters']} iters, converged={res_picard_cold['converged']}")
+
+    # Save results
+    results = {
+        "Re": Re_test,
+        "N": N,
+        "device": str(device),
+        "Re_100": {
+            "cold_iters": res_cold_100['iters'],
+            "cold_converged": res_cold_100['converged'],
+            "zero_df_iters": res_df_100['iters'],
+            "zero_df_converged": res_df_100['converged'],
+        },
+        "Re_500_continuation": {
+            "cold_iters": res_cold_500['iters'],
+            "cold_converged": res_cold_500['converged'],
+            "zero_df_iters": res_df_500['iters'],
+            "zero_df_converged": res_df_500['converged'],
+            "surrogate_iters": res_surrogate_500['iters'] if res_surrogate_500 else None,
+            "surrogate_converged": res_surrogate_500['converged'] if res_surrogate_500 else None,
+            "speedup": res_cold_500['iters'] / max(1, res_surrogate_500['iters']) if res_surrogate_500 else None,
+        },
+        "Re_500_pure_picard": {
+            "cold_iters": res_picard_cold['iters'],
+            "cold_converged": res_picard_cold['converged'],
+        },
+        "paper_claims": {
+            "table10_continuation_cold": 500,
+            "table10_continuation_surrogate": 120,
+            "table10_speedup": 4.2,
+            "footnote_picard_cold": 3000,
+            "footnote_picard_zero_df": 500,
+            "footnote_picard_surrogate": 500,
+        }
+    }
+
+    out_path = os.path.join(os.path.dirname(__file__), '..', 'results', 'warmstart_audit.json')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"INFO: Saved to {out_path}")
+
+    print("INFO: ==================================================================")
+
 
 if __name__ == '__main__':
-    results_dir = REPO_ROOT / 'results'
-    results_dir.mkdir(exist_ok=True)
-
-    logger.info(f"Assembling solver (n={N_NODES}, Re={RE})")
-    logger.info(f"WARNING: Re={RE} is outside training range (Re ∈ [10, 100]).")
-    logger.info(f"Using pure Picard with n_max={N_MAX} (no continuation).")
-    logger.info(f"Paper's Table 10 uses continuation solver with lower iteration counts.")
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-
-    points = generate_cavity_points(n=N_NODES).to(device)
-    solver = NavierStokesSolver(points=points, k=STENCIL_K, eps=1e-8)
-
-    G_int = solver.G_int
-
-    # Condition A: Cold start
-    res_cold = run_solver(solver, None, 'Cold start (zero, non-div-free)')
-
-    # Condition B: Div-free zero field
-    df_zero = make_div_free_zero(solver)
-    div_res_zero = float((G_int @ df_zero).norm().item())
-    logger.info(f"  Div-free zero: ||G v||={div_res_zero:.2e}")
-
-    res_zero_df = run_solver(solver, df_zero, 'Div-free zero field (no physics)')
-
-    # Condition C: Surrogate warm start
-    if CHECKPOINT.exists():
-        model = load_surrogate_model(CHECKPOINT, solver)
-        surrogate_field = generate_surrogate_prediction(model, solver, Re=RE)
-        proj_field = project_to_div_free(G_int, surrogate_field, solver.interior_dof_mask)
-        div_res_proj = float((G_int @ proj_field).norm().item())
-        logger.info(f"  Projected surrogate div: {div_res_proj:.2e}")
-
-        res_surrogate = run_solver(solver, proj_field, 'Projected surrogate warm start')
-    else:
-        logger.warning(f"Checkpoint not found: {CHECKPOINT}")
-        logger.warning("Skipping surrogate condition. Train model first.")
-        res_surrogate = {
-            'label': 'Surrogate (SKIPPED)', 'iterations': 0,
-            'time_s': 0.0, 'final_mom_residual': float('nan'),
-            'final_div_residual': float('nan'), 'converged': False,
-        }
-
-    # Analysis
-    iter_cold = res_cold['iterations']
-    iter_zero_df = res_zero_df['iterations']
-    iter_surrogate = res_surrogate['iterations']
-
-    # Check convergence
-    cold_converged = res_cold['converged']
-    zero_df_converged = res_zero_df['converged']
-
-    if not cold_converged and not zero_df_converged:
-        logger.warning("Both cold start and div-free zero failed to converge.")
-        logger.warning(f"Consider increasing n_max (current: {N_MAX}) or using continuation solver.")
-
-    if iter_surrogate > 0:
-        speedup_total = iter_cold / max(iter_surrogate, 1)
-        speedup_algebraic = iter_cold / max(iter_zero_df, 1)
-        speedup_physics = iter_zero_df / max(iter_surrogate, 1)
-
-        total_reduction = iter_cold - iter_surrogate
-        frac_algebraic = (iter_cold - iter_zero_df) / total_reduction if total_reduction > 0 else 0.0
-        frac_physics = (iter_zero_df - iter_surrogate) / total_reduction if total_reduction > 0 else 0.0
-
-        primary_component = 'ALGEBRAIC' if frac_algebraic > 0.6 else 'PHYSICS'
-
-        logger.info(f"\n{'='*70}")
-        logger.info(f"WARM-START DECOMPOSITION (Re={RE}, n={N_NODES}, pure Picard)")
-        logger.info(f"{'='*70}")
-        logger.info(f"  Cold start:      {iter_cold} iters (converged: {cold_converged})")
-        logger.info(f"  Div-free zero:   {iter_zero_df} iters (converged: {zero_df_converged})")
-        logger.info(f"  Surrogate:       {iter_surrogate} iters")
-        logger.info(f"  Total speedup:   {speedup_total:.2f}×")
-        logger.info(f"  Algebraic:       {speedup_algebraic:.2f}× ({frac_algebraic*100:.1f}%)")
-        logger.info(f"  Physics:         {speedup_physics:.2f}× ({frac_physics*100:.1f}%)")
-        logger.info(f"  Primary:         {primary_component}")
-        logger.info(f"\n  Paper comparison (Table 10, continuation solver):")
-        logger.info(f"    Paper cold:      {PAPER_ITER_COLD}")
-        logger.info(f"    Paper surrogate: {PAPER_ITER_SURROGATE}")
-        logger.info(f"    Paper speedup:   {PAPER_SPEEDUP}×")
-        logger.info(f"\n  Paper comparison (footnote, pure Picard):")
-        logger.info(f"    Paper cold:      {PAPER_PICARD_COLD}")
-        logger.info(f"    Paper zero-df:   {PAPER_PICARD_ZERO_DF}")
-        logger.info(f"    Paper surrogate: {PAPER_PICARD_SURROGATE}")
-        logger.info(f"{'='*70}\n")
-    else:
-        logger.info(f"\n{'='*70}")
-        logger.info(f"WARM-START DECOMPOSITION (Re={RE}, n={N_NODES}, pure Picard)")
-        logger.info(f"{'='*70}")
-        logger.info(f"  Cold start:      {iter_cold} iters (converged: {cold_converged})")
-        logger.info(f"  Div-free zero:   {iter_zero_df} iters (converged: {zero_df_converged})")
-        logger.info(f"  Surrogate:       SKIPPED (no checkpoint)")
-        logger.info(f"  Partial speedup: {iter_cold/max(iter_zero_df,1):.2f}× (algebraic)")
-        logger.info(f"\n  Paper comparison (footnote, pure Picard):")
-        logger.info(f"    Paper cold:      {PAPER_PICARD_COLD}")
-        logger.info(f"    Paper zero-df:   {PAPER_PICARD_ZERO_DF}")
-        logger.info(f"    Paper surrogate: {PAPER_PICARD_SURROGATE}")
-        logger.info(f"{'='*70}\n")
-        speedup_total = 0.0
-        speedup_algebraic = iter_cold / max(iter_zero_df, 1)
-        speedup_physics = 0.0
-        frac_algebraic = 1.0
-        frac_physics = 0.0
-        primary_component = 'ALGEBRAIC (partial — no surrogate)'
-
-    output = {
-        'Re': RE, 'N': N_NODES,
-        'iter_cold': iter_cold,
-        'iter_div_free_zero': iter_zero_df,
-        'iter_surrogate': iter_surrogate,
-        'speedup_total': round(speedup_total, 3),
-        'speedup_algebraic': round(speedup_algebraic, 3),
-        'speedup_physics': round(speedup_physics, 3),
-        'frac_algebraic_pct': round(frac_algebraic * 100.0, 1),
-        'frac_physics_pct': round(frac_physics * 100.0, 1),
-        'primary_component': primary_component,
-        'cold_converged': cold_converged,
-        'zero_df_converged': zero_df_converged,
-        'paper_table10_cold': PAPER_ITER_COLD,
-        'paper_table10_surrogate': PAPER_ITER_SURROGATE,
-        'paper_table10_speedup': PAPER_SPEEDUP,
-        'paper_picard_cold': PAPER_PICARD_COLD,
-        'paper_picard_zero_df': PAPER_PICARD_ZERO_DF,
-        'paper_picard_surrogate': PAPER_PICARD_SURROGATE,
-        'time_cold_s': round(res_cold['time_s'], 3),
-        'time_zero_df_s': round(res_zero_df['time_s'], 3),
-        'time_surrogate_s': round(res_surrogate.get('time_s', 0.0), 3),
-        'checkpoint_exists': CHECKPOINT.exists(),
-        'solver_config': 'pure_picard_no_continuation',
-        'n_max': N_MAX,
-    }
-
-    out_path = results_dir / 'warmstart_decomposition.json'
-    with open(out_path, 'w') as f:
-        json.dump(output, f, indent=2)
-    logger.info(f"Saved to {out_path}")
+    main()
